@@ -1,0 +1,42 @@
+[package]
+name = "PeaDrive"
+version = "0.1.0"
+edition = "2021"
+description = "Sao chép trực tiếp file/thư mục từ một thư mục Google Drive công khai ra ổ đĩa (API key, không cần đăng nhập); tùy chọn đăng nhập Google (OAuth) để đổi tên/xóa file trên thư mục đã chia sẻ quyền chỉnh sửa."
+
+[dependencies]
+# GUI (immediate-mode, thuần Rust, không cần cài GTK/Qt hệ thống)
+eframe = "0.35"
+egui = "0.35"
+log = "0.4"
+env_logger = "0.11"
+
+# Async runtime + HTTP client
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "time", "net", "io-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+futures-util = "0.3"
+
+# JSON (Google Drive API v3 trả JSON)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Parse link Google Drive / dựng URL OAuth
+url = "2"
+
+# Hộp thoại chọn thư mục lưu, kiểu native của hệ điều hành
+rfd = "0.17"
+
+# Lỗi + lưu cấu hình (API key, token OAuth) vào đúng thư mục config của HĐH
+anyhow = "1"
+directories = "6"
+
+# Đăng nhập Google (OAuth 2.0 + PKCE) — chỉ dùng cho tính năng đổi tên/xóa
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+open = "5"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

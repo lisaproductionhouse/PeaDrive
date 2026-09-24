@@ -1,0 +1,8 @@
+Font: Noto Sans (Regular), tập con Latin/Greek/Cyrillic
+Nguồn: https://github.com/notofonts/latin-greek-cyrillic
+Bản quyền: Copyright 2022 The Noto Project Authors
+Giấy phép: SIL Open Font License, Version 1.1
+Toàn văn giấy phép (kèm FAQ chính thức): https://scripts.sil.org/OFL
+
+Font này được nhúng vào ứng dụng chỉ để đảm bảo hiển thị đúng dấu tiếng Việt
+(egui không có sẵn font hỗ trợ tiếng Việt), không chỉnh sửa nội dung font.
