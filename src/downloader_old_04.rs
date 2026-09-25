@@ -98,6 +98,7 @@ pub enum WorkerEvent {
         new_name: String,
     },
     RenameFailed {
+        entry_id: String,
         error: String,
     },
 
@@ -107,6 +108,7 @@ pub enum WorkerEvent {
         name: String,
     },
     TrashFailed {
+        entry_id: String,
         name: String,
         error: String,
     },

@@ -415,7 +415,7 @@ impl GDriveCopierApp {
                     self.renaming = None;
                     self.set_status("Đã đổi tên.", false);
                 }
-                WorkerEvent::RenameFailed { error, .. } => {
+                WorkerEvent::RenameFailed { error } => {
                     self.set_status(format!("Đổi tên thất bại: {error}"), true);
                 }
                 WorkerEvent::FileTrashed { entry_id, name } => {
@@ -432,7 +432,7 @@ impl GDriveCopierApp {
                          dọn)"
                     ));
                 }
-                WorkerEvent::TrashFailed { name, error, .. } => {
+                WorkerEvent::TrashFailed { name, error } => {
                     self.log_line(format!("✘ Không xóa được {name}: {error}"));
                     self.set_status(format!("Không xóa được '{name}': {error}"), true);
                 }
@@ -754,7 +754,6 @@ impl GDriveCopierApp {
                     Ok(t) => t,
                     Err(e) => {
                         let _ = tx.send(WorkerEvent::RenameFailed {
-                            entry_id,
                             error: e.to_string(),
                         });
                         return;
@@ -767,7 +766,6 @@ impl GDriveCopierApp {
                 }
                 Err(e) => {
                     let _ = tx.send(WorkerEvent::RenameFailed {
-                        entry_id,
                         error: e.to_string(),
                     });
                 }
@@ -831,7 +829,6 @@ impl GDriveCopierApp {
                     Ok(t) => t,
                     Err(e) => {
                         let _ = tx.send(WorkerEvent::TrashFailed {
-                            entry_id,
                             name,
                             error: e.to_string(),
                         });
@@ -845,7 +842,6 @@ impl GDriveCopierApp {
                 }
                 Err(e) => {
                     let _ = tx.send(WorkerEvent::TrashFailed {
-                        entry_id,
                         name,
                         error: e.to_string(),
                     });
@@ -872,7 +868,6 @@ impl GDriveCopierApp {
                     Ok(t) => t,
                     Err(e) => {
                         let _ = tx.send(WorkerEvent::TrashFailed {
-                            entry_id,
                             name,
                             error: e.to_string(),
                         });
@@ -887,7 +882,6 @@ impl GDriveCopierApp {
                 Ok(id) => id,
                 Err(e) => {
                     let _ = tx.send(WorkerEvent::TrashFailed {
-                        entry_id,
                         name,
                         error: e.to_string(),
                     });
@@ -903,7 +897,6 @@ impl GDriveCopierApp {
                 }
                 Err(e) => {
                     let _ = tx.send(WorkerEvent::TrashFailed {
-                        entry_id,
                         name,
                         error: e.to_string(),
                     });
@@ -1006,7 +999,6 @@ impl GDriveCopierApp {
                 }
                 Err(e) => {
                     let _ = tx.send(WorkerEvent::TrashFailed {
-                        entry_id: String::new(),
                         name: "(không lấy được quyền truy cập)".to_string(),
                         error: e.to_string(),
                     });
@@ -1077,7 +1069,6 @@ impl GDriveCopierApp {
                                 }
                                 Err(e) => {
                                     return (
-                                        entry_id,
                                         name,
                                         Err(format!("Không làm mới được phiên đăng nhập: {e}")),
                                     );
@@ -1155,7 +1146,7 @@ impl GDriveCopierApp {
                                 }
                                 Err(e) => Err(format!("Không kiểm tra được quyền sở hữu: {e}")),
                             };
-                        (entry_id, name, outcome)
+                        (name, outcome)
                     }
                 })
                 .buffer_unordered(concurrency);
@@ -1164,7 +1155,7 @@ impl GDriveCopierApp {
             let mut failed = 0usize;
             let mut skipped = 0usize;
             let mut done = 0usize;
-            while let Some((entry_id, name, outcome)) = result_stream.next().await {
+            while let Some((name, outcome)) = result_stream.next().await {
                 match outcome {
                     Ok(Some(event)) => {
                         succeeded += 1;
@@ -1176,7 +1167,6 @@ impl GDriveCopierApp {
                     Err(error) => {
                         failed += 1;
                         let _ = tx.send(WorkerEvent::TrashFailed {
-                            entry_id,
                             name,
                             error,
                         });

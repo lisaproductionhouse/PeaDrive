@@ -5,8 +5,9 @@
 
 use crate::config::{AppConfig, ConflictPolicy};
 use crate::downloader::{self, WorkerEvent};
-use crate::drive_api::{extract_drive_id, DriveClient, DriveEditClient, DriveEntry};
+use crate::drive_api::{build_shared_http_client, extract_drive_id, DriveClient, DriveEditClient, DriveEntry};
 use crate::oauth::OAuthTokens;
+use futures_util::stream::{self, StreamExt};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -20,6 +21,32 @@ enum FolderSizeState {
     Computing,
     Known { files: usize, bytes: u64 },
     Error,
+}
+
+/// Tên thư mục dùng làm nơi "gom" các file KHÔNG do tài khoản đang đăng
+/// nhập sở hữu khi xóa (Google chỉ cho phép CHỦ SỞ HỮU chuyển thẳng vào
+/// Thùng rác — xem `drive_api::WriteOperation::Trash`) — tạo ngay bên trong
+/// thư mục cha của từng file, để chủ sở hữu dễ tìm thấy khi họ ghé qua.
+const QUARANTINE_FOLDER_NAME: &str = "_Đã đánh dấu xóa (chờ chủ sở hữu xóa hẳn)";
+
+/// Trạng thái của banner xác nhận xóa 1 file — luôn kiểm tra chủ sở hữu
+/// TRƯỚC khi hỏi xác nhận, vì Google chỉ cho phép CHỦ SỞ HỮU chuyển thẳng
+/// vào Thùng rác (kể cả có quyền Editor qua link cũng không đủ), nên phải
+/// biết trước để hỏi đúng câu hỏi thay vì để người dùng gặp lỗi 403 rồi mới
+/// biết.
+#[derive(Clone)]
+enum ConfirmDeleteState {
+    CheckingOwnership(DriveEntry),
+    /// KHÔNG phải chủ sở hữu — cần hỏi trước khi chuyển sang thư mục riêng.
+    /// Nếu LÀ chủ sở hữu, không có trạng thái chờ xác nhận nào cả: xóa
+    /// thẳng vào Thùng rác ngay khi biết kết quả kiểm tra (xem
+    /// `WorkerEvent::OwnershipChecked`), đỡ phải hỏi thêm 1 bước cho
+    /// trường hợp đơn giản/phổ biến nhất.
+    NotOwned {
+        entry: DriveEntry,
+        owner_label: Option<String>,
+        parent_id: Option<String>,
+    },
 }
 
 enum JobState {
@@ -49,6 +76,12 @@ enum JobState {
 
 pub struct GDriveCopierApp {
     config: AppConfig,
+    /// 1 `reqwest::Client` DÙNG CHUNG cho mọi lời gọi Drive API + OAuth
+    /// trong suốt vòng đời app — xem `drive_api::build_shared_http_client`.
+    /// `.clone()` ở đây chỉ tăng refcount Arc bên trong, không dựng lại
+    /// pool kết nối, nên có thể clone thoải mái mỗi khi cần đưa vào 1 tác
+    /// vụ nền (spawn) mà không lo tốn kém.
+    http: reqwest::Client,
     api_key_input: String,
     show_settings: bool,
 
@@ -86,14 +119,24 @@ pub struct GDriveCopierApp {
 
     /// (entry_id, tên đang gõ dở) của dòng đang được đổi tên tại chỗ.
     renaming: Option<(String, String)>,
-    /// File đang chờ xác nhận trước khi thật sự chuyển vào Thùng rác.
-    confirm_delete: Option<DriveEntry>,
+    /// File đang chờ xác nhận trước khi thật sự chuyển vào Thùng rác — bao
+    /// gồm cả bước đang kiểm tra chủ sở hữu (xem `ConfirmDeleteState`).
+    confirm_delete: Option<ConfirmDeleteState>,
+    /// Đồng ý cho chuyển vào thư mục chuẩn bị xóa hay không, khi
+    /// `confirm_delete` đang ở trạng thái `NotOwned` — mặc định `true`.
+    confirm_delete_move_aside: bool,
 
     bulk_delete_input: String,
     /// Sau khi bấm "Tìm", danh sách các mục KHỚP tên đang hiển thị để xem
     /// trước, cùng số dòng nhập KHÔNG khớp file nào (để minh bạch).
     bulk_delete_matches: Vec<DriveEntry>,
     bulk_delete_unmatched: usize,
+    /// Đồng ý cho CHUYỂN các file KHÔNG do mình sở hữu vào thư mục chuẩn bị
+    /// xóa hay không — hỏi 1 LẦN DUY NHẤT trước khi bắt đầu (không hỏi lại
+    /// giữa chừng theo từng file), mặc định `true` để đỡ thao tác vì rủi ro
+    /// thấp (file luôn còn trong Thùng rác hoặc thư mục tạm, không mất gì).
+    /// File do MÌNH sở hữu luôn được xóa thẳng, không phụ thuộc cờ này.
+    bulk_delete_move_aside_agreed: bool,
 
     runtime: tokio::runtime::Runtime,
     event_tx: UnboundedSender<WorkerEvent>,
@@ -105,6 +148,8 @@ impl GDriveCopierApp {
         setup_vietnamese_font(&cc.egui_ctx);
 
         let config = AppConfig::load();
+        let http = build_shared_http_client()
+            .expect("Không dựng được HTTP client dùng chung cho Drive API");
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
         let runtime = tokio::runtime::Runtime::new().expect("Không khởi tạo được tokio runtime");
         let destination = config.last_destination.clone();
@@ -112,6 +157,7 @@ impl GDriveCopierApp {
         let oauth_client_id_input = config.oauth_client_id.clone().unwrap_or_default();
         let oauth_client_secret_input = config.oauth_client_secret.clone().unwrap_or_default();
         Self {
+            http,
             api_key_input: config.api_key.clone().unwrap_or_default(),
             show_settings,
             config,
@@ -132,9 +178,11 @@ impl GDriveCopierApp {
             login_busy: false,
             renaming: None,
             confirm_delete: None,
+            confirm_delete_move_aside: true,
             bulk_delete_input: String::new(),
             bulk_delete_matches: Vec::new(),
             bulk_delete_unmatched: 0,
+            bulk_delete_move_aside_agreed: true,
             runtime,
             event_tx,
             event_rx,
@@ -188,7 +236,7 @@ impl GDriveCopierApp {
             .api_key
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Chưa cấu hình Google API key"))?;
-        DriveClient::new(key)
+        Ok(DriveClient::new(self.http.clone(), key))
     }
 
     /// Xử lý mọi sự kiện đã có sẵn trong hàng đợi (không chặn — nếu chưa có
@@ -362,26 +410,76 @@ impl GDriveCopierApp {
                     self.selected.remove(&entry_id);
                     self.log_line(format!("🗑 Đã chuyển vào Thùng rác: {name}"));
                 }
+                WorkerEvent::FileMovedAside { entry_id, name } => {
+                    self.current_entries.retain(|e| e.id != entry_id);
+                    self.selected.remove(&entry_id);
+                    self.log_line(format!(
+                        "↪ Đã chuyển '{name}' sang thư mục \"{QUARANTINE_FOLDER_NAME}\" \
+                         (không phải chủ sở hữu nên không xóa thẳng được, chờ chủ sở hữu tự \
+                         dọn)"
+                    ));
+                }
                 WorkerEvent::TrashFailed { name, error, .. } => {
                     self.log_line(format!("✘ Không xóa được {name}: {error}"));
                     self.set_status(format!("Không xóa được '{name}': {error}"), true);
                 }
+                WorkerEvent::OwnershipChecked { entry, info } => {
+                    if info.owned_by_me {
+                        // Là chủ sở hữu — trường hợp đơn giản/phổ biến nhất,
+                        // xóa thẳng luôn, không hỏi thêm cho đỡ lằng nhằng.
+                        self.confirm_delete = None;
+                        self.start_delete(entry);
+                    } else {
+                        self.confirm_delete_move_aside = true;
+                        // Dùng THƯ MỤC ĐANG MỞ làm thư mục cha để chuyển đi,
+                        // KHÔNG dùng field 'parents' Google trả về lúc kiểm
+                        // tra sở hữu — đổi tên/xóa chỉ áp dụng cho mục nằm
+                        // trong thư mục đang mở (xem README) nên đây luôn
+                        // đúng, trong khi 'parents' đôi khi bị Google trả về
+                        // rỗng dù file hoàn toàn bình thường (đã gặp thực tế
+                        // với file DSC06559.jpg — không rõ lý do từ phía
+                        // Google, nhưng đằng nào cũng không cần tới field đó).
+                        let parent_id = self.breadcrumbs.last().map(|(id, _)| id.clone());
+                        self.confirm_delete = Some(ConfirmDeleteState::NotOwned {
+                            entry,
+                            owner_label: info.owner_label,
+                            parent_id,
+                        });
+                    }
+                }
+                WorkerEvent::OwnershipCheckFailed { entry, error } => {
+                    self.confirm_delete = None;
+                    self.set_status(
+                        format!("Không kiểm tra được quyền sở hữu '{}': {error}", entry.name),
+                        true,
+                    );
+                }
                 WorkerEvent::BulkTrashProgress { done, total } => {
                     self.job = JobState::BulkDeleting { done, total };
                 }
-                WorkerEvent::BulkTrashFinished { succeeded, failed } => {
+                WorkerEvent::BulkTrashFinished {
+                    succeeded,
+                    failed,
+                    skipped,
+                } => {
                     self.job = JobState::Idle;
                     self.bulk_delete_matches.clear();
                     self.bulk_delete_input.clear();
+                    let skipped_note = if skipped > 0 {
+                        format!(" ({skipped} bỏ qua vì không sở hữu)")
+                    } else {
+                        String::new()
+                    };
                     if failed == 0 {
                         self.set_status(
-                            format!("Đã chuyển {succeeded} file vào Thùng rác."),
+                            format!("Đã xử lý xong {succeeded} file{skipped_note}."),
                             false,
                         );
                     } else {
                         self.set_status(
                             format!(
-                                "Xong: {succeeded} thành công, {failed} thất bại (xem nhật ký)."
+                                "Xong: {succeeded} thành công, {failed} thất bại{skipped_note} \
+                                 (xem nhật ký)."
                             ),
                             true,
                         );
@@ -587,10 +685,11 @@ impl GDriveCopierApp {
         self.login_busy = true;
         self.status_message = None;
         let tx = self.event_tx.clone();
+        let http = self.http.clone();
         self.runtime.spawn(async move {
-            match crate::oauth::login(client_id, client_secret).await {
+            match crate::oauth::login(&http, client_id, client_secret).await {
                 Ok(tokens) => {
-                    let email = crate::oauth::fetch_user_email(&tokens.access_token).await;
+                    let email = crate::oauth::fetch_user_email(&http, &tokens.access_token).await;
                     let _ = tx.send(WorkerEvent::LoginSucceeded { tokens, email });
                 }
                 Err(e) => {
@@ -636,9 +735,10 @@ impl GDriveCopierApp {
             return;
         };
         let tx = self.event_tx.clone();
+        let http = self.http.clone();
         self.runtime.spawn(async move {
             let access_token =
-                match ensure_fresh_and_notify(&client_id, &client_secret, tokens, &tx).await {
+                match ensure_fresh_and_notify(&http, &client_id, &client_secret, tokens, &tx).await {
                     Ok(t) => t,
                     Err(e) => {
                         let _ = tx.send(WorkerEvent::RenameFailed {
@@ -648,7 +748,7 @@ impl GDriveCopierApp {
                         return;
                     }
                 };
-            let edit_client = DriveEditClient::new();
+            let edit_client = DriveEditClient::new(http);
             match edit_client.rename_file(&access_token, &entry_id, &new_name).await {
                 Ok(()) => {
                     let _ = tx.send(WorkerEvent::FileRenamed { entry_id, new_name });
@@ -656,6 +756,45 @@ impl GDriveCopierApp {
                 Err(e) => {
                     let _ = tx.send(WorkerEvent::RenameFailed {
                         entry_id,
+                        error: e.to_string(),
+                    });
+                }
+            }
+        });
+    }
+
+    /// Kiểm tra tài khoản đang đăng nhập có phải chủ sở hữu file này không,
+    /// TRƯỚC KHI hiện banner xác nhận xóa — vì Google chỉ cho phép CHỦ SỞ
+    /// HỮU chuyển thẳng vào Thùng rác (quyền Editor qua link không đủ), nên
+    /// cần biết trước để hỏi đúng câu hỏi (xóa thẳng, hay đề xuất chuyển
+    /// sang thư mục riêng) thay vì để người dùng gặp lỗi 403 khó hiểu.
+    fn start_check_ownership(&mut self, entry: DriveEntry) {
+        let Some((client_id, client_secret, tokens)) = self.oauth_credentials() else {
+            return;
+        };
+        self.confirm_delete = Some(ConfirmDeleteState::CheckingOwnership(entry.clone()));
+        let tx = self.event_tx.clone();
+        let http = self.http.clone();
+        self.runtime.spawn(async move {
+            let access_token =
+                match ensure_fresh_and_notify(&http, &client_id, &client_secret, tokens, &tx).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let _ = tx.send(WorkerEvent::OwnershipCheckFailed {
+                            entry,
+                            error: e.to_string(),
+                        });
+                        return;
+                    }
+                };
+            let edit_client = DriveEditClient::new(http);
+            match edit_client.check_ownership(&access_token, &entry.id).await {
+                Ok(info) => {
+                    let _ = tx.send(WorkerEvent::OwnershipChecked { entry, info });
+                }
+                Err(e) => {
+                    let _ = tx.send(WorkerEvent::OwnershipCheckFailed {
+                        entry,
                         error: e.to_string(),
                     });
                 }
@@ -671,11 +810,12 @@ impl GDriveCopierApp {
             return;
         };
         let tx = self.event_tx.clone();
+        let http = self.http.clone();
         let entry_id = entry.id;
         let name = entry.name;
         self.runtime.spawn(async move {
             let access_token =
-                match ensure_fresh_and_notify(&client_id, &client_secret, tokens, &tx).await {
+                match ensure_fresh_and_notify(&http, &client_id, &client_secret, tokens, &tx).await {
                     Ok(t) => t,
                     Err(e) => {
                         let _ = tx.send(WorkerEvent::TrashFailed {
@@ -686,10 +826,68 @@ impl GDriveCopierApp {
                         return;
                     }
                 };
-            let edit_client = DriveEditClient::new();
+            let edit_client = DriveEditClient::new(http);
             match edit_client.trash_file(&access_token, &entry_id).await {
                 Ok(()) => {
                     let _ = tx.send(WorkerEvent::FileTrashed { entry_id, name });
+                }
+                Err(e) => {
+                    let _ = tx.send(WorkerEvent::TrashFailed {
+                        entry_id,
+                        name,
+                        error: e.to_string(),
+                    });
+                }
+            }
+        });
+    }
+
+    /// Chuyển 1 file KHÔNG do tài khoản đang đăng nhập sở hữu sang thư mục
+    /// riêng `QUARANTINE_FOLDER_NAME` (tạo ngay bên trong `parent_id` nếu
+    /// chưa có) — thay thế cho việc xóa thẳng, vì Google chắc chắn từ chối
+    /// (chỉ chủ sở hữu mới chuyển vào Thùng rác được).
+    fn start_move_aside(&mut self, entry: DriveEntry, parent_id: String) {
+        let Some((client_id, client_secret, tokens)) = self.oauth_credentials() else {
+            return;
+        };
+        let tx = self.event_tx.clone();
+        let http = self.http.clone();
+        let entry_id = entry.id;
+        let name = entry.name;
+        self.runtime.spawn(async move {
+            let access_token =
+                match ensure_fresh_and_notify(&http, &client_id, &client_secret, tokens, &tx).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let _ = tx.send(WorkerEvent::TrashFailed {
+                            entry_id,
+                            name,
+                            error: e.to_string(),
+                        });
+                        return;
+                    }
+                };
+            let edit_client = DriveEditClient::new(http);
+            let quarantine_id = match edit_client
+                .find_or_create_folder(&access_token, &parent_id, QUARANTINE_FOLDER_NAME)
+                .await
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    let _ = tx.send(WorkerEvent::TrashFailed {
+                        entry_id,
+                        name,
+                        error: e.to_string(),
+                    });
+                    return;
+                }
+            };
+            match edit_client
+                .move_file(&access_token, &entry_id, &parent_id, &quarantine_id, None)
+                .await
+            {
+                Ok(()) => {
+                    let _ = tx.send(WorkerEvent::FileMovedAside { entry_id, name });
                 }
                 Err(e) => {
                     let _ = tx.send(WorkerEvent::TrashFailed {
@@ -763,7 +961,18 @@ impl GDriveCopierApp {
         }
     }
 
-    fn start_bulk_delete(&mut self, entries: Vec<DriveEntry>) {
+    /// Kiểm tra quyền sở hữu VÀ xóa/chuyển đi LUÔN cho từng file — gộp 2
+    /// giai đoạn "kiểm tra hết 784 file rồi mới hỏi rồi mới làm" thành 1
+    /// giai đoạn liên tục, đỡ phải chờ xong hết mới bắt đầu làm file đầu
+    /// tiên, và không cần hỏi xác nhận giữa chừng: rủi ro thực tế rất thấp
+    /// vì file luôn còn nguyên trong Thùng rác (khôi phục được 30 ngày)
+    /// hoặc trong thư mục tạm (`QUARANTINE_FOLDER_NAME`), không mất gì.
+    /// `allow_move_aside`: người dùng đã đồng ý TRƯỚC (tick sẵn ở ô nhập,
+    /// mặc định bật) cho chuyển các file KHÔNG do mình sở hữu vào thư mục
+    /// tạm hay chưa — file do MÌNH sở hữu luôn được xóa thẳng, không phụ
+    /// thuộc cờ này; file KHÔNG sở hữu mà cờ này tắt thì bị bỏ qua hoàn
+    /// toàn (không đụng tới, tính vào `skipped`).
+    fn start_bulk_delete(&mut self, entries: Vec<DriveEntry>, allow_move_aside: bool) {
         if entries.is_empty() {
             return;
         }
@@ -776,10 +985,34 @@ impl GDriveCopierApp {
         };
         self.status_message = None;
         let tx = self.event_tx.clone();
+        let http = self.http.clone();
+        // Giới hạn số request chạy đồng thời — dùng lại đúng số luồng tải
+        // song song đã cấu hình, để không bắn quá nhiều request cùng lúc
+        // lên Google (đỡ làm nặng thêm rủi ro rate-limit 429 đã biết).
+        let concurrency = self.config.max_concurrent_downloads.max(1);
+        // Thư mục đang mở — CHỈ dùng làm phương án dự phòng cho parent_id
+        // khi Google không trả về field 'parents' lúc kiểm tra sở hữu (đã
+        // gặp thực tế với file hoàn toàn bình thường). ƯU TIÊN giá trị
+        // Google trả về khi CÓ, vì ghi đè bừa bằng thư mục đang mở cho MỌI
+        // file (bất kể Google đã trả lời gì) từng gây lỗi 403 "Increasing
+        // the number of parents is not allowed" — tức Google từ chối vì
+        // file không thật sự có thư mục đang mở làm cha trong 1 số trường
+        // hợp, nên KHÔNG được ghi đè giá trị Google đã xác nhận đúng.
+        let fallback_parent_id = self.breadcrumbs.last().map(|(id, _)| id.clone());
+        // Cache thư mục tạm theo parent_id, DÙNG CHUNG giữa mọi file chạy
+        // song song — không có cache này, nhiều file cùng thư mục cha sẽ
+        // ĐUA NHAU gọi find_or_create_folder gần như cùng lúc, mỗi request
+        // đều thấy "chưa có" (vì chưa request nào kịp tạo xong) nên tự tạo
+        // riêng, ra NHIỀU thư mục trùng tên (đã gặp thực tế). Giữ khóa
+        // (Mutex) trong lúc tìm-hoặc-tạo: file nào tới trước làm luôn, các
+        // file khác cùng thư mục cha xếp hàng chờ rồi dùng lại kết quả đã
+        // có, không tự tạo thêm.
+        let quarantine_cache: Arc<tokio::sync::Mutex<HashMap<String, String>>> =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
 
         self.runtime.spawn(async move {
             let access_token =
-                match ensure_fresh_and_notify(&client_id, &client_secret, tokens, &tx).await {
+                match ensure_fresh_and_notify(&http, &client_id, &client_secret, tokens, &tx).await {
                     Ok(t) => t,
                     Err(e) => {
                         let _ = tx.send(WorkerEvent::TrashFailed {
@@ -790,36 +1023,165 @@ impl GDriveCopierApp {
                         let _ = tx.send(WorkerEvent::BulkTrashFinished {
                             succeeded: 0,
                             failed: entries.len(),
+                            skipped: 0,
                         });
                         return;
                     }
                 };
-            let edit_client = DriveEditClient::new();
+            let edit_client = DriveEditClient::new(http);
             let total = entries.len();
+
+            // Mỗi file: kiểm tra sở hữu rồi XỬ LÝ NGAY (không tách thành 2
+            // lượt riêng như trước) — chạy song song có giới hạn, báo tiến
+            // độ/kết quả ngay khi từng file xong (thứ tự dòng log có thể
+            // xen kẽ khác thứ tự trong danh sách gốc 1 chút, số liệu tổng
+            // cuối cùng không đổi).
+            let mut result_stream = stream::iter(entries)
+                .map(|entry| {
+                    let edit_client = &edit_client;
+                    let access_token = &access_token;
+                    let fallback_parent_id = fallback_parent_id.clone();
+                    let quarantine_cache = quarantine_cache.clone();
+                    async move {
+                        let entry_id = entry.id.clone();
+                        let name = entry.name.clone();
+                        let outcome: Result<Option<WorkerEvent>, String> =
+                            match edit_client.check_ownership(access_token, &entry_id).await {
+                                Ok(info) if info.owned_by_me => edit_client
+                                    .trash_file(access_token, &entry_id)
+                                    .await
+                                    .map(|()| {
+                                        Some(WorkerEvent::FileTrashed {
+                                            entry_id: entry_id.clone(),
+                                            name: name.clone(),
+                                        })
+                                    })
+                                    .map_err(|e| e.to_string()),
+                                // Không sở hữu mà chưa được đồng ý chuyển
+                                // đi — bỏ qua hoàn toàn, không đụng tới.
+                                Ok(_) if !allow_move_aside => Ok(None),
+                                Ok(info) => {
+                                    match info.parent_id.or(fallback_parent_id) {
+                                        Some(parent_id) => {
+                                            // Giữ khóa SUỐT LÚC tìm-hoặc-tạo
+                                            // (kể cả khi phải gọi API) — file
+                                            // khác cùng parent_id đang chờ
+                                            // khóa này sẽ thấy NGAY kết quả
+                                            // vừa cache khi tới lượt, không
+                                            // tự gọi API tạo thêm.
+                                            let quarantine_id = {
+                                                let mut cache = quarantine_cache.lock().await;
+                                                if let Some(id) = cache.get(&parent_id) {
+                                                    Ok(id.clone())
+                                                } else {
+                                                    let created = edit_client
+                                                        .find_or_create_folder(
+                                                            access_token,
+                                                            &parent_id,
+                                                            QUARANTINE_FOLDER_NAME,
+                                                        )
+                                                        .await;
+                                                    if let Ok(id) = &created {
+                                                        cache.insert(parent_id.clone(), id.clone());
+                                                    }
+                                                    created.map_err(|e| e.to_string())
+                                                }
+                                            };
+                                            match quarantine_id {
+                                                Ok(quarantine_id) => edit_client
+                                                    .move_file(
+                                                        access_token,
+                                                        &entry_id,
+                                                        &parent_id,
+                                                        &quarantine_id,
+                                                        None,
+                                                    )
+                                                    .await
+                                                    .map(|()| {
+                                                        Some(WorkerEvent::FileMovedAside {
+                                                            entry_id: entry_id.clone(),
+                                                            name: name.clone(),
+                                                        })
+                                                    })
+                                                    .map_err(|e| e.to_string()),
+                                                Err(e) => Err(e),
+                                            }
+                                        }
+                                        None => Err(
+                                            "Không xác định được thư mục cha để chuyển file đi"
+                                                .to_string(),
+                                        ),
+                                    }
+                                }
+                                Err(e) => Err(format!("Không kiểm tra được quyền sở hữu: {e}")),
+                            };
+                        (entry_id, name, outcome)
+                    }
+                })
+                .buffer_unordered(concurrency);
+
             let mut succeeded = 0usize;
             let mut failed = 0usize;
-            for (i, entry) in entries.into_iter().enumerate() {
-                match edit_client.trash_file(&access_token, &entry.id).await {
-                    Ok(()) => {
+            let mut skipped = 0usize;
+            let mut done = 0usize;
+            while let Some((entry_id, name, outcome)) = result_stream.next().await {
+                match outcome {
+                    Ok(Some(event)) => {
                         succeeded += 1;
-                        let _ = tx.send(WorkerEvent::FileTrashed {
-                            entry_id: entry.id,
-                            name: entry.name,
-                        });
+                        let _ = tx.send(event);
                     }
-                    Err(e) => {
+                    Ok(None) => {
+                        skipped += 1;
+                    }
+                    Err(error) => {
                         failed += 1;
                         let _ = tx.send(WorkerEvent::TrashFailed {
-                            entry_id: entry.id,
-                            name: entry.name,
-                            error: e.to_string(),
+                            entry_id,
+                            name,
+                            error,
                         });
                     }
                 }
-                let _ = tx.send(WorkerEvent::BulkTrashProgress { done: i + 1, total });
+                done += 1;
+                let _ = tx.send(WorkerEvent::BulkTrashProgress { done, total });
             }
-            let _ = tx.send(WorkerEvent::BulkTrashFinished { succeeded, failed });
+            let _ = tx.send(WorkerEvent::BulkTrashFinished {
+                succeeded,
+                failed,
+                skipped,
+            });
         });
+    }
+
+    /// Trạng thái đăng nhập Google, hiện Ở GÓC PHẢI thanh tiêu đề — LUÔN
+    /// thấy được (không cần mở Cài đặt) để biết ngay đang thao tác bằng
+    /// tài khoản nào, quan trọng vì việc xóa phụ thuộc đúng tài khoản đang
+    /// đăng nhập (xem `ConfirmDeleteState`).
+    fn draw_account_status(&mut self, ui: &mut egui::Ui) {
+        if self.is_logged_in() {
+            if ui.small_button("Đăng xuất").clicked() {
+                self.start_logout();
+            }
+            let who = self
+                .config
+                .oauth_email
+                .clone()
+                .unwrap_or_else(|| "(không rõ email)".to_string());
+            ui.colored_label(egui::Color32::from_rgb(96, 176, 112), format!("✔ {who}"));
+        } else if self.login_busy {
+            ui.spinner();
+            ui.weak("Đang chờ đăng nhập...");
+        } else if self.config.oauth_client_id.is_some() && self.config.oauth_client_secret.is_some()
+        {
+            if ui.small_button("Đăng nhập Google").clicked() {
+                self.start_login();
+            }
+        } else {
+            if ui.small_button("Cài đặt...").clicked() {
+                self.show_settings = true;
+            }
+            ui.weak("Chưa đăng nhập:");
+        }
     }
 
     fn draw_settings(&mut self, ui: &mut egui::Ui) {
@@ -911,14 +1273,18 @@ impl GDriveCopierApp {
         }
     }
 
+    /// Link Drive + thư mục lưu + chính sách trùng tên gộp CHUNG 1 dòng
+    /// (tự xuống dòng nếu cửa sổ hẹp) — khung dán link không cần rộng vì
+    /// dán xong là xong, không cần đọc lại, nên nhường chỗ ngang cho 2 mục
+    /// còn lại thay vì mỗi mục chiếm nguyên 1 dòng riêng.
     fn draw_link_bar(&mut self, ui: &mut egui::Ui) {
         let busy = self.is_busy();
-        ui.horizontal(|ui| {
-            ui.label("Link thư mục Drive:");
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Link Drive:");
             let resp = ui.add_enabled(
                 !busy,
                 egui::TextEdit::singleline(&mut self.link_input)
-                    .desired_width(400.0)
+                    .desired_width(220.0)
                     .hint_text("https://drive.google.com/drive/folders/..."),
             );
             let enter_pressed = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -928,6 +1294,42 @@ impl GDriveCopierApp {
             }
             if ui.button("⚙").on_hover_text("Cài đặt API key").clicked() {
                 self.show_settings = true;
+            }
+
+            ui.separator();
+
+            ui.label("Lưu vào:");
+            let text = self
+                .destination
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "(chưa chọn)".to_string());
+            ui.monospace(text);
+            if ui.button("Chọn thư mục...").clicked() {
+                self.start_pick_folder();
+            }
+
+            ui.separator();
+
+            ui.label("Nếu trùng tên:");
+            // Dùng biến cục bộ cho ComboBox, không đụng `self` bên trong
+            // closure lồng của `show_ui` — chỉ ghi lại vào self SAU KHI
+            // combo box đã đóng, để chắc chắn không vướng borrow-checker.
+            let mut new_policy = self.config.conflict_policy;
+            egui::ComboBox::from_id_salt("conflict_policy_combo")
+                .selected_text(new_policy.label())
+                .show_ui(ui, |ui| {
+                    for policy in [
+                        ConflictPolicy::Skip,
+                        ConflictPolicy::Overwrite,
+                        ConflictPolicy::Rename,
+                    ] {
+                        ui.selectable_value(&mut new_policy, policy, policy.label());
+                    }
+                });
+            if new_policy != self.config.conflict_policy {
+                self.config.conflict_policy = new_policy;
+                let _ = self.config.save();
             }
         });
     }
@@ -954,43 +1356,6 @@ impl GDriveCopierApp {
         if let Some(i) = go_to {
             self.navigate_to_breadcrumb(i);
         }
-    }
-
-    fn draw_destination_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label("Lưu vào:");
-            let text = self
-                .destination
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "(chưa chọn — sẽ hỏi khi bạn bấm Tải)".to_string());
-            ui.monospace(text);
-            if ui.button("Chọn thư mục...").clicked() {
-                self.start_pick_folder();
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label("Nếu trùng tên file:");
-            // Dùng biến cục bộ cho ComboBox, không đụng `self` bên trong
-            // closure lồng của `show_ui` — chỉ ghi lại vào self SAU KHI
-            // combo box đã đóng, để chắc chắn không vướng borrow-checker.
-            let mut new_policy = self.config.conflict_policy;
-            egui::ComboBox::from_id_salt("conflict_policy_combo")
-                .selected_text(new_policy.label())
-                .show_ui(ui, |ui| {
-                    for policy in [
-                        ConflictPolicy::Skip,
-                        ConflictPolicy::Overwrite,
-                        ConflictPolicy::Rename,
-                    ] {
-                        ui.selectable_value(&mut new_policy, policy, policy.label());
-                    }
-                });
-            if new_policy != self.config.conflict_policy {
-                self.config.conflict_policy = new_policy;
-                let _ = self.config.save();
-            }
-        });
     }
 
     fn draw_entry_list(&mut self, ui: &mut egui::Ui) {
@@ -1039,7 +1404,7 @@ impl GDriveCopierApp {
             ui.weak("Nhấp đúp vào tên thư mục để mở. Giữ Shift khi tick để chọn nhanh cả khoảng.");
         }
 
-        egui::ScrollArea::vertical().max_height(320.0).show_rows(
+        egui::ScrollArea::vertical().max_height(260.0).show_rows(
             ui,
             24.0,
             entries.len(),
@@ -1170,24 +1535,56 @@ impl GDriveCopierApp {
             self.start_rename(id, new_name);
         }
         if let Some(entry) = delete_clicked {
-            self.confirm_delete = Some(entry);
+            self.start_check_ownership(entry);
         }
 
-        if let Some(entry) = self.confirm_delete.clone() {
+        if let Some(state) = self.confirm_delete.clone() {
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.colored_label(
-                    egui::Color32::from_rgb(224, 96, 96),
-                    format!("Chuyển '{}' vào Thùng rác?", entry.name),
-                );
-                if ui.button("Xóa").clicked() {
-                    self.confirm_delete = None;
-                    self.start_delete(entry.clone());
+            match state {
+                ConfirmDeleteState::CheckingOwnership(entry) => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(format!("Đang kiểm tra quyền sở hữu '{}'...", entry.name));
+                    });
                 }
-                if ui.button("Hủy").clicked() {
-                    self.confirm_delete = None;
+                ConfirmDeleteState::NotOwned {
+                    entry,
+                    owner_label,
+                    parent_id,
+                } => {
+                    let owner = owner_label.as_deref().unwrap_or("không rõ");
+                    ui.colored_label(
+                        egui::Color32::from_rgb(224, 176, 96),
+                        format!(
+                            "'{}' không phải của bạn (chủ sở hữu: {owner}) nên Google không \
+                             cho xóa thẳng.",
+                            entry.name
+                        ),
+                    );
+                    ui.checkbox(
+                        &mut self.confirm_delete_move_aside,
+                        format!("Cho phép chuyển vào thư mục \"{QUARANTINE_FOLDER_NAME}\""),
+                    );
+                    ui.horizontal(|ui| {
+                        let can_proceed = self.confirm_delete_move_aside && parent_id.is_some();
+                        if ui.add_enabled(can_proceed, egui::Button::new("Xóa")).clicked() {
+                            self.confirm_delete = None;
+                            if let Some(parent_id) = parent_id.clone() {
+                                self.start_move_aside(entry.clone(), parent_id);
+                            }
+                        }
+                        if ui.button("Hủy").clicked() {
+                            self.confirm_delete = None;
+                        }
+                    });
+                    if parent_id.is_none() {
+                        ui.weak(
+                            "(Không xác định được thư mục cha của file này nên chưa thể chuyển \
+                             đi — thử lại từ đầu.)",
+                        );
+                    }
                 }
-            });
+            }
         }
 
         if let Some(entry) = download_single {
@@ -1279,20 +1676,18 @@ impl GDriveCopierApp {
         let matches_snapshot = self.bulk_delete_matches.clone();
         let unmatched = self.bulk_delete_unmatched;
         let mut find_clicked = false;
-        let mut confirm_clicked = false;
+        let mut execute_clicked = false;
 
         egui::CollapsingHeader::new("Xóa hàng loạt theo danh sách tên")
             .default_open(false)
             .show(ui, |ui| {
                 ui.weak(
-                    "Dán danh sách tên file — mỗi tên 1 dòng, hoặc cách nhau bằng dấu phẩy (,), \
-                     chấm phẩy (;) hay khoảng trắng đều được (tên file có khoảng trắng vẫn được \
-                     nhận đúng, miễn là không cách nhau CHỈ bằng khoảng trắng với tên khác trên \
-                     cùng dòng). Cũng có thể KÉO THẢ 1 file .txt chứa danh sách vào cửa sổ app.",
+                    "Dán danh sách tên (mỗi tên 1 dòng, hoặc cách nhau bằng dấu phẩy/chấm \
+                     phẩy/khoảng trắng), hoặc kéo-thả 1 file .txt vào đây.",
                 );
                 ui.add(
                     egui::TextEdit::multiline(&mut self.bulk_delete_input)
-                        .desired_rows(4)
+                        .desired_rows(3)
                         .desired_width(f32::INFINITY)
                         .hint_text("vidu_1.mp4, vidu_2.jpg\nvidu_3.mp4; vidu_4.png\n..."),
                 );
@@ -1319,13 +1714,25 @@ impl GDriveCopierApp {
                         }
                     });
                     ui.add_space(4.0);
-                    let confirm_label =
-                        format!("🗑 Chuyển {} file vào Thùng rác", matches_snapshot.len());
-                    if ui
-                        .add_enabled(!busy, egui::Button::new(confirm_label))
-                        .clicked()
-                    {
-                        confirm_clicked = true;
+                    // Hỏi 1 LẦN DUY NHẤT trước khi bắt đầu, áp dụng cho MỌI
+                    // file không sở hữu gặp trong lượt này — không dừng lại
+                    // hỏi thêm giữa chừng theo từng file nữa (vừa chậm vì
+                    // phải kiểm tra hết mới hỏi, vừa không cần thiết: file
+                    // luôn còn nguyên trong Thùng rác hoặc thư mục tạm,
+                    // không mất gì nên không có nhiều rủi ro phải cân nhắc).
+                    ui.add_enabled(
+                        !busy,
+                        egui::Checkbox::new(
+                            &mut self.bulk_delete_move_aside_agreed,
+                            format!(
+                                "Cho phép chuyển các file KHÔNG do bạn sở hữu vào thư mục \
+                                 \"{QUARANTINE_FOLDER_NAME}\" (để chủ sở hữu tự vào xóa)"
+                            ),
+                        ),
+                    );
+                    let label = format!("🗑 Chuyển {} file vào Thùng rác", matches_snapshot.len());
+                    if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
+                        execute_clicked = true;
                     }
                 }
             });
@@ -1333,9 +1740,10 @@ impl GDriveCopierApp {
         if find_clicked {
             self.find_bulk_delete_matches();
         }
-        if confirm_clicked {
-            let matches = std::mem::take(&mut self.bulk_delete_matches);
-            self.start_bulk_delete(matches);
+        if execute_clicked {
+            let entries = self.bulk_delete_matches.clone();
+            let allow_move_aside = self.bulk_delete_move_aside_agreed;
+            self.start_bulk_delete(entries, allow_move_aside);
         }
     }
 
@@ -1431,7 +1839,12 @@ impl eframe::App for GDriveCopierApp {
         self.update_speed_estimate();
 
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("Sao chép thư mục Google Drive công khai");
+            ui.horizontal(|ui| {
+                ui.heading("Sao chép thư mục Google Drive công khai");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.draw_account_status(ui);
+                });
+            });
             ui.add_space(4.0);
 
             if self.show_settings || self.config.api_key.is_none() {
@@ -1442,25 +1855,37 @@ impl eframe::App for GDriveCopierApp {
             self.draw_link_bar(ui);
             self.draw_breadcrumbs(ui);
             ui.separator();
-            self.draw_destination_bar(ui);
-            ui.separator();
-            self.draw_entry_list(ui);
-            if self.is_logged_in() {
-                ui.separator();
-                self.draw_bulk_delete_section(ui);
-            }
-            ui.separator();
-            self.draw_job_status(ui);
 
-            if let Some((msg, is_error)) = self.status_message.clone() {
-                ui.add_space(4.0);
-                let color = if is_error {
-                    egui::Color32::from_rgb(224, 96, 96)
-                } else {
-                    egui::Color32::from_rgb(96, 176, 112)
-                };
-                ui.colored_label(color, msg);
-            }
+            // Mọi thứ CÓ THỂ dài (danh sách file, xóa hàng loạt, banner xác
+            // nhận, tiến độ, nhật ký...) đặt trong 1 vùng CUỘN ĐƯỢC. Đo
+            // thẳng chiều cao CÒN LẠI của cửa sổ ngay tại đây rồi truyền
+            // showo(`max_height`) — KHÔNG để `ScrollArea` tự suy luận —
+            // vì đây là nguyên nhân trước đó khiến vùng cuộn cứ giãn to
+            // theo đúng chiều cao nội dung thay vì co lại theo cửa sổ,
+            // dẫn tới các nút ở cuối (đặc biệt banner xác nhận xóa, nút
+            // "Tìm & xem trước") bị đẩy ra ngoài mà không cuộn tới được.
+            let remaining_height = ui.available_height();
+            egui::ScrollArea::vertical()
+                .max_height(remaining_height)
+                .show(ui, |ui| {
+                    self.draw_entry_list(ui);
+                    if self.is_logged_in() {
+                        ui.separator();
+                        self.draw_bulk_delete_section(ui);
+                    }
+                    ui.separator();
+                    self.draw_job_status(ui);
+
+                    if let Some((msg, is_error)) = self.status_message.clone() {
+                        ui.add_space(4.0);
+                        let color = if is_error {
+                            egui::Color32::from_rgb(224, 96, 96)
+                        } else {
+                            egui::Color32::from_rgb(96, 176, 112)
+                        };
+                        ui.colored_label(color, msg);
+                    }
+                });
         });
 
         if self.is_busy() {
@@ -1474,12 +1899,13 @@ impl eframe::App for GDriveCopierApp {
 /// hết hạn), báo cho GUI biết qua `TokensRefreshed` để lưu lại vào cấu hình
 /// nếu có thay đổi. Dùng chung cho mọi thao tác ghi (đổi tên/xóa).
 async fn ensure_fresh_and_notify(
+    http: &reqwest::Client,
     client_id: &str,
     client_secret: &str,
     tokens: OAuthTokens,
     tx: &UnboundedSender<WorkerEvent>,
 ) -> anyhow::Result<String> {
-    let fresh = crate::oauth::ensure_fresh(client_id, client_secret, tokens.clone()).await?;
+    let fresh = crate::oauth::ensure_fresh(http, client_id, client_secret, tokens.clone()).await?;
     if fresh.access_token != tokens.access_token {
         let _ = tx.send(WorkerEvent::TokensRefreshed(fresh.clone()));
     }
