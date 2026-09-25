@@ -11,8 +11,8 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1240.0, 760.0])
-            .with_min_inner_size([900.0, 540.0])
+            .with_inner_size([780.0, 760.0])
+            .with_min_inner_size([480.0, 420.0])
             .with_title("Sao chép thư mục Google Drive công khai"),
         ..Default::default()
     };
