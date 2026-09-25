@@ -11,7 +11,7 @@
 //! ├─────────────────────────────────────────────┬──────────────────┤
 //! │ ⬆ ⟳  Gốc › Thư mục › ...                    │ Tiến độ          │
 //! │ [banner thông báo / xác nhận xóa]           │ ████░░  12/50    │
-//! │ 120 mục · đã chọn 3    [Tải tất cả][Tải …]  │ 1.2/4.5 GB ...   │
+//! │ 120 mục · đã chọn 3          [🗑 Xóa][⬇ Tải xuống]│ 1.2/4.5 GB ...   │
 //! │ ☐ Tên                 Dung lượng            │ [Nhật ký|Tải/Xóa]│
 //! │ ☐ 📁 Thư mục A        xem dung lượng   Tải  │  ✔ a.jpg         │
 //! │ ☑ 🎬 clip.mp4         1.2 GB      Tải ✎ 🗑  │  ✘ b.mp4: lỗi    │
@@ -1661,21 +1661,36 @@ impl GDriveCopierApp {
     }
 
     /// Dòng công cụ phía trên bảng: số mục + tóm tắt phần đã chọn (trái),
-    /// nút Tải (phải).
+    /// nút Tải xuống / Xóa cho phần đã chọn (phải) — chọn tất cả đã có ô
+    /// tick ở đầu bảng (`draw_table_header`) nên không cần thêm nút riêng.
     fn draw_list_toolbar(&mut self, ui: &mut egui::Ui) {
         let busy = self.is_busy();
+        let logged_in = self.is_logged_in();
         let n = self.current_entries.len();
         let (sel_count, sel_bytes, sel_unknown) =
             selection_summary(&self.current_entries, &self.selected, &self.folder_sizes);
-        let mut download_all = false;
         let mut download_selected = false;
+        let mut delete_selected = false;
 
         ui.allocate_ui_with_layout(
             vec2(ui.available_width(), 30.0),
             Layout::right_to_left(Align::Center),
             |ui| {
+                let delete_resp = ui.add_enabled(
+                    !busy && sel_count > 0 && logged_in,
+                    egui::Button::new("🗑 Xóa"),
+                );
+                let delete_resp = if !logged_in {
+                    delete_resp.on_hover_text("Cần đăng nhập Google để xóa (mục Cài đặt)")
+                } else {
+                    delete_resp.on_hover_text("Chuyển các mục đã chọn vào Thùng rác")
+                };
+                if delete_resp.clicked() {
+                    delete_selected = true;
+                }
+
                 let primary =
-                    egui::Button::new(RichText::new("⬇ Tải đã chọn").color(Color32::WHITE))
+                    egui::Button::new(RichText::new("⬇ Tải xuống").color(Color32::WHITE))
                         .fill(ACCENT);
                 if ui
                     .add_enabled(!busy && sel_count > 0, primary)
@@ -1683,13 +1698,7 @@ impl GDriveCopierApp {
                 {
                     download_selected = true;
                 }
-                if ui
-                    .add_enabled(!busy, egui::Button::new("⬇ Tải tất cả"))
-                    .on_hover_text("Tải tất cả mục đang hiển thị")
-                    .clicked()
-                {
-                    download_all = true;
-                }
+
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     let mut text = format!("{n} mục");
                     if sel_count > 0 {
@@ -1708,10 +1717,6 @@ impl GDriveCopierApp {
             },
         );
 
-        if download_all {
-            let entries = self.current_entries.clone();
-            self.start_download(entries);
-        }
         if download_selected {
             let sel: Vec<DriveEntry> = self
                 .current_entries
@@ -1721,6 +1726,17 @@ impl GDriveCopierApp {
                 .collect();
             self.selected.clear();
             self.start_download(sel);
+        }
+        if delete_selected {
+            let sel: Vec<DriveEntry> = self
+                .current_entries
+                .iter()
+                .filter(|e| self.selected.contains(&e.id))
+                .cloned()
+                .collect();
+            self.selected.clear();
+            let allow_move_aside = self.bulk_delete_move_aside_agreed;
+            self.start_bulk_delete(sel, allow_move_aside);
         }
     }
 
@@ -2292,7 +2308,7 @@ impl eframe::App for GDriveCopierApp {
 // Thành phần giao diện dùng chung
 // ---------------------------------------------------------------------------
 
-/// Màu nhấn cho nút chính ("Tải đã chọn").
+/// Màu nhấn cho nút chính ("Tải xuống").
 const ACCENT: Color32 = Color32::from_rgb(45, 108, 223);
 
 /// Chiều cao 1 dòng trong bảng file — CỐ ĐỊNH để `ScrollArea::show_rows` chỉ
