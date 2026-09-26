@@ -11,8 +11,8 @@
 //! ├─────────────────────────────────────────────┬──────────────────┤
 //! │ ⬆ ⟳  Gốc › Thư mục › ...                    │ Tiến độ          │
 //! │ [banner thông báo / xác nhận xóa]           │ ████░░  12/50    │
-//! │ 120 mục · đã chọn 3          [🗑 Xóa][⬇ Tải xuống]│ 1.2/4.5 GB ...   │
-//! │ ☐ Tên                 Dung lượng            │ [Nhật ký|Nhập ds]│
+//! │ 120 mục · đã chọn 3    [Tải tất cả][Tải …]  │ 1.2/4.5 GB ...   │
+//! │ ☐ Tên                 Dung lượng            │ [Nhật ký|Tải/Xóa]│
 //! │ ☐ 📁 Thư mục A        xem dung lượng   Tải  │  ✔ a.jpg         │
 //! │ ☑ 🎬 clip.mp4         1.2 GB      Tải ✎ 🗑  │  ✘ b.mp4: lỗi    │
 //! ├─────────────────────────────────────────────┴──────────────────┤
@@ -22,7 +22,7 @@
 //!
 //! - Thanh trên: link + tài khoản + cài đặt (luôn thấy).
 //! - Vùng giữa: đường dẫn, thông báo, bảng file (chiếm gần hết cửa sổ).
-//! - Khung phải (kéo giãn được): tiến độ tải, rồi tab Nhật ký / Nhập danh sách.
+//! - Khung phải (kéo giãn được): tiến độ tải, rồi tab Nhật ký / Tải-Xóa hàng loạt.
 //! - Thanh dưới: nơi lưu + cách xử lý trùng tên.
 
 use crate::config::{AppConfig, ConflictPolicy};
@@ -110,7 +110,7 @@ enum JobState {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ActivityTab {
     Log,
-    ImportList,
+    BulkList,
 }
 
 pub struct GDriveCopierApp {
@@ -181,7 +181,7 @@ pub struct GDriveCopierApp {
     /// File do MÌNH sở hữu luôn được xóa thẳng, không phụ thuộc cờ này.
     bulk_delete_move_aside_agreed: bool,
 
-    /// Tab đang mở ở khung bên phải (Nhật ký / Nhập danh sách).
+    /// Tab đang mở ở khung bên phải (Nhật ký / Tải-Xóa hàng loạt).
     activity_tab: ActivityTab,
     /// `true` ngay sau khi bấm ✎ — ô đổi tên xin focus 1 lần ở khung hình kế tiếp.
     rename_focus: bool,
@@ -1286,7 +1286,7 @@ impl GDriveCopierApp {
                         self.bulk_list_input.push('\n');
                     }
                     self.bulk_list_input.push_str(content);
-                    self.activity_tab = ActivityTab::ImportList;
+                    self.activity_tab = ActivityTab::BulkList;
                     self.set_status(format!("Đã nạp danh sách từ file: {}", path.display()), false);
                 }
                 Err(e) => {
@@ -1661,36 +1661,21 @@ impl GDriveCopierApp {
     }
 
     /// Dòng công cụ phía trên bảng: số mục + tóm tắt phần đã chọn (trái),
-    /// nút Tải xuống / Xóa cho phần đã chọn (phải) — chọn tất cả đã có ô
-    /// tick ở đầu bảng (`draw_table_header`) nên không cần thêm nút riêng.
+    /// nút Tải (phải).
     fn draw_list_toolbar(&mut self, ui: &mut egui::Ui) {
         let busy = self.is_busy();
-        let logged_in = self.is_logged_in();
         let n = self.current_entries.len();
         let (sel_count, sel_bytes, sel_unknown) =
             selection_summary(&self.current_entries, &self.selected, &self.folder_sizes);
+        let mut download_all = false;
         let mut download_selected = false;
-        let mut delete_selected = false;
 
         ui.allocate_ui_with_layout(
             vec2(ui.available_width(), 30.0),
             Layout::right_to_left(Align::Center),
             |ui| {
-                let delete_resp = ui.add_enabled(
-                    !busy && sel_count > 0 && logged_in,
-                    egui::Button::new("🗑 Xóa"),
-                );
-                let delete_resp = if !logged_in {
-                    delete_resp.on_hover_text("Cần đăng nhập Google để xóa (mục Cài đặt)")
-                } else {
-                    delete_resp.on_hover_text("Chuyển các mục đã chọn vào Thùng rác")
-                };
-                if delete_resp.clicked() {
-                    delete_selected = true;
-                }
-
                 let primary =
-                    egui::Button::new(RichText::new("⬇ Tải xuống").color(Color32::WHITE))
+                    egui::Button::new(RichText::new("⬇ Tải đã chọn").color(Color32::WHITE))
                         .fill(ACCENT);
                 if ui
                     .add_enabled(!busy && sel_count > 0, primary)
@@ -1698,7 +1683,13 @@ impl GDriveCopierApp {
                 {
                     download_selected = true;
                 }
-
+                if ui
+                    .add_enabled(!busy, egui::Button::new("⬇ Tải tất cả"))
+                    .on_hover_text("Tải tất cả mục đang hiển thị")
+                    .clicked()
+                {
+                    download_all = true;
+                }
                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                     let mut text = format!("{n} mục");
                     if sel_count > 0 {
@@ -1717,6 +1708,10 @@ impl GDriveCopierApp {
             },
         );
 
+        if download_all {
+            let entries = self.current_entries.clone();
+            self.start_download(entries);
+        }
         if download_selected {
             let sel: Vec<DriveEntry> = self
                 .current_entries
@@ -1726,17 +1721,6 @@ impl GDriveCopierApp {
                 .collect();
             self.selected.clear();
             self.start_download(sel);
-        }
-        if delete_selected {
-            let sel: Vec<DriveEntry> = self
-                .current_entries
-                .iter()
-                .filter(|e| self.selected.contains(&e.id))
-                .cloned()
-                .collect();
-            self.selected.clear();
-            let allow_move_aside = self.bulk_delete_move_aside_agreed;
-            self.start_bulk_delete(sel, allow_move_aside);
         }
     }
 
@@ -1927,18 +1911,18 @@ impl GDriveCopierApp {
     }
 
     // ------------------------------------------------------------------
-    // Khung bên phải: tiến độ + (nhật ký | nhập danh sách)
+    // Khung bên phải: tiến độ + (nhật ký | tải/xóa hàng loạt)
     // ------------------------------------------------------------------
 
     fn draw_activity_panel(&mut self, ui: &mut egui::Ui) {
         self.draw_job_card(ui);
         ui.add_space(4.0);
 
-        // Chỉ cần đã mở 1 thư mục để có mục mà khớp tên — bản thân việc
-        // NHẬP (khớp tên rồi tick chọn) không cần đăng nhập; đăng nhập chỉ
-        // cần khi người dùng bấm nút "Xóa" ở khung trái cho các mục đã tick.
-        let import_available = !self.current_entries.is_empty();
-        if !import_available && self.activity_tab == ActivityTab::ImportList {
+        // Tải theo danh sách KHÔNG cần đăng nhập (dùng API key như mọi cách
+        // tải khác), chỉ cần đã mở 1 thư mục để có mục mà khớp tên; riêng
+        // phần xóa trong cùng tab mới cần đăng nhập (xem `draw_bulk_list_tab`).
+        let bulk_available = self.is_logged_in() || !self.current_entries.is_empty();
+        if !bulk_available && self.activity_tab == ActivityTab::BulkList {
             self.activity_tab = ActivityTab::Log;
         }
         ui.horizontal(|ui| {
@@ -1947,11 +1931,11 @@ impl GDriveCopierApp {
                 ActivityTab::Log,
                 format!("Nhật ký ({})", self.log.len()),
             );
-            if import_available {
+            if bulk_available {
                 ui.selectable_value(
                     &mut self.activity_tab,
-                    ActivityTab::ImportList,
-                    "Nhập danh sách",
+                    ActivityTab::BulkList,
+                    "Tải / Xóa hàng loạt",
                 );
             }
         });
@@ -1959,7 +1943,7 @@ impl GDriveCopierApp {
 
         match self.activity_tab {
             ActivityTab::Log => self.draw_log_tab(ui),
-            ActivityTab::ImportList => self.draw_import_list_tab(ui),
+            ActivityTab::BulkList => self.draw_bulk_list_tab(ui),
         }
     }
 
@@ -2084,16 +2068,17 @@ impl GDriveCopierApp {
         }
     }
 
-    /// Ô nhập danh sách tên: khớp với thư mục đang xem rồi TỰ ĐỘNG TICK CHỌN
-    /// đúng các mục đó ngay trên bảng file ở khung trái — không tự tải/xóa
-    /// gì ở đây cả, người dùng dùng lại 2 nút "Tải xuống" / "Xóa" đã có sẵn
-    /// trên khung trái (trong `draw_list_toolbar`) cho các mục vừa tick,
-    /// giống hệt như khi tick tay từng dòng. Nhờ vậy chỉ có DUY NHẤT một
-    /// luồng thực thi tải/xóa trong toàn bộ app, đỡ phải giữ 2 bản logic
-    /// giống nhau ở 2 nơi.
-    fn draw_import_list_tab(&mut self, ui: &mut egui::Ui) {
+    /// Ô nhập danh sách tên + xem trước các mục khớp trong thư mục đang xem.
+    /// Cùng 1 danh sách dùng được cho 2 việc (xem `draw_activity_panel` cho
+    /// điều kiện hiện tab này): TẢI về máy — luôn có, KHÔNG cần đăng nhập
+    /// (vẫn dùng API key như các cách tải khác); chuyển vào Thùng rác — chỉ
+    /// hiện khi đã đăng nhập Google.
+    fn draw_bulk_list_tab(&mut self, ui: &mut egui::Ui) {
         let busy = self.is_busy();
-        let mut import_clicked = false;
+        let logged_in = self.is_logged_in();
+        let mut find_clicked = false;
+        let mut download_clicked = false;
+        let mut delete_clicked = false;
 
         egui::ScrollArea::vertical()
             .id_salt("bulk_tab_scroll")
@@ -2101,10 +2086,9 @@ impl GDriveCopierApp {
             .show(ui, |ui| {
                 ui.weak(
                     "Dán danh sách tên (mỗi tên 1 dòng, hoặc cách nhau bằng dấu phẩy/chấm \
-                     phẩy/khoảng trắng), hoặc kéo-thả 1 file .txt vào cửa sổ, rồi bấm Nhập để \
-                     tự động tick chọn đúng các file đó trong danh sách bên trái. Tên phải khớp \
-                     CHÍNH XÁC tên đang hiển thị trong thư mục đang xem. Sau khi tick xong, dùng \
-                     nút \"Tải xuống\" hoặc \"Xóa\" ở khung bên trái như bình thường.",
+                     phẩy/khoảng trắng), hoặc kéo-thả 1 file .txt vào cửa sổ. Tên phải khớp \
+                     CHÍNH XÁC tên đang hiển thị trong thư mục đang xem. Tải thì không cần \
+                     đăng nhập, xóa thì cần.",
                 );
                 ui.add_space(4.0);
                 // Giới hạn chiều cao hiển thị — không bọc thì egui tự giãn
@@ -2114,7 +2098,7 @@ impl GDriveCopierApp {
                 // không mất chữ.
                 egui::ScrollArea::vertical()
                     .id_salt("bulk_list_input_scroll")
-                    .max_height(150.0)
+                    .max_height(120.0)
                     .show(ui, |ui| {
                         ui.add(
                             egui::TextEdit::multiline(&mut self.bulk_list_input)
@@ -2125,55 +2109,130 @@ impl GDriveCopierApp {
                     });
                 ui.add_space(4.0);
                 if ui
-                    .add_enabled(!busy, egui::Button::new("Nhập"))
+                    .add_enabled(!busy, egui::Button::new("Tìm & xem trước"))
                     .clicked()
                 {
-                    import_clicked = true;
+                    find_clicked = true;
                 }
 
-                // Chỉ còn hiện DANH SÁCH KHÔNG KHỚP ở đây — mục khớp thì đã
-                // tick thẳng lên bảng bên trái rồi (xem được ngay ở đó), nên
-                // không lặp lại thêm 1 bản danh sách nữa cho đỡ trùng lặp.
-                // Số lượng đã tick được báo qua banner thông báo phía trên
-                // bảng file (xem chỗ gọi `import_clicked` bên dưới).
-                if !self.bulk_list_unmatched.is_empty() {
+                if !self.bulk_list_matches.is_empty() || !self.bulk_list_unmatched.is_empty() {
                     ui.add_space(8.0);
+                    ui.label(format!(
+                        "Khớp {} mục, {} tên không khớp mục nào trong thư mục đang xem",
+                        self.bulk_list_matches.len(),
+                        self.bulk_list_unmatched.len()
+                    ));
+                }
+                if !self.bulk_list_matches.is_empty() {
+                    let row_h = ui.text_style_height(&egui::TextStyle::Body);
+                    let matches = &self.bulk_list_matches;
+                    egui::ScrollArea::vertical()
+                        .id_salt("bulk_list_matches_scroll")
+                        .max_height(180.0)
+                        .show_rows(ui, row_h, matches.len(), |ui, row_range| {
+                            for i in row_range {
+                                let e = &matches[i];
+                                let mut line = format!("• {}  {}", entry_icon(e), e.name);
+                                if let Some(size) = e.size {
+                                    line.push_str(&format!(" — {}", format_bytes(size)));
+                                }
+                                ui.add(egui::Label::new(line).truncate());
+                            }
+                        });
+                }
+                // Liệt kê RIÊNG các tên không khớp (không chỉ đếm) để người
+                // dùng thấy ngay tên nào gõ sai / không nằm trong thư mục
+                // này, khỏi phải tự đối chiếu cả danh sách dài.
+                if !self.bulk_list_unmatched.is_empty() {
+                    ui.add_space(4.0);
                     ui.colored_label(
                         tone_color(ui, Tone::Warn),
-                        format!(
-                            "{} tên không khớp mục nào (kiểm tra chính tả, đuôi file, chữ \
-                             hoa/thường):",
-                            self.bulk_list_unmatched.len()
-                        ),
+                        "Các tên này không khớp mục nào (kiểm tra chính tả, đuôi file, chữ \
+                         hoa/thường):",
                     );
                     let row_h = ui.text_style_height(&egui::TextStyle::Body);
                     let unmatched = &self.bulk_list_unmatched;
                     egui::ScrollArea::vertical()
                         .id_salt("bulk_list_unmatched_scroll")
-                        .max_height(220.0)
+                        .max_height(80.0)
                         .show_rows(ui, row_h, unmatched.len(), |ui, row_range| {
                             for i in row_range {
                                 ui.add(egui::Label::new(format!("• {}", unmatched[i])).truncate());
                             }
                         });
                 }
+
+                if !self.bulk_list_matches.is_empty() {
+                    ui.add_space(6.0);
+                    // Tên khớp 1 THƯ MỤC thì cả thư mục (đệ quy) được tải —
+                    // nên đếm là "mục", và ghi chú riêng số thư mục chưa
+                    // biết dung lượng (giống nút "Tải N mục đã chọn").
+                    let (known_bytes, unknown_folders) =
+                        sum_known_size(self.bulk_list_matches.iter(), &self.folder_sizes);
+                    let mut download_label = format!(
+                        "⬇ Tải {} mục (~{})",
+                        self.bulk_list_matches.len(),
+                        format_bytes(known_bytes)
+                    );
+                    if unknown_folders > 0 {
+                        download_label
+                            .push_str(&format!(" +{unknown_folders} thư mục chưa rõ dung lượng"));
+                    }
+                    if ui
+                        .add_enabled(
+                            !busy,
+                            egui::Button::new(download_label)
+                                .min_size(vec2(ui.available_width(), 28.0)),
+                        )
+                        .clicked()
+                    {
+                        download_clicked = true;
+                    }
+
+                    if logged_in {
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.weak("Hoặc xóa các mục khớp khỏi Drive:");
+                        // Hỏi 1 LẦN DUY NHẤT trước khi bắt đầu, áp dụng cho MỌI
+                        // file không sở hữu gặp trong lượt này — không dừng lại
+                        // hỏi thêm giữa chừng theo từng file nữa (vừa chậm vì
+                        // phải kiểm tra hết mới hỏi, vừa không cần thiết: file
+                        // luôn còn nguyên trong Thùng rác hoặc thư mục tạm,
+                        // không mất gì nên không có nhiều rủi ro phải cân nhắc).
+                        ui.add_enabled(
+                            !busy,
+                            egui::Checkbox::new(
+                                &mut self.bulk_delete_move_aside_agreed,
+                                "Cho phép chuyển file không sở hữu vào thư mục tạm",
+                            ),
+                        );
+                        let label =
+                            format!("🗑 Chuyển {} file vào Thùng rác", self.bulk_list_matches.len());
+                        if ui
+                            .add_enabled(
+                                !busy,
+                                egui::Button::new(label)
+                                    .min_size(vec2(ui.available_width(), 28.0)),
+                            )
+                            .clicked()
+                        {
+                            delete_clicked = true;
+                        }
+                    }
+                }
             });
 
-        if import_clicked {
+        if find_clicked {
             self.find_bulk_list_matches();
-            if !self.bulk_list_matches.is_empty() {
-                for e in &self.bulk_list_matches {
-                    self.selected.insert(e.id.clone());
-                }
-                let mut msg = format!("Đã tick chọn {} mục", self.bulk_list_matches.len());
-                if !self.bulk_list_unmatched.is_empty() {
-                    msg.push_str(&format!(
-                        " · {} tên không khớp mục nào",
-                        self.bulk_list_unmatched.len()
-                    ));
-                }
-                self.set_status(msg, false);
-            }
+        }
+        if download_clicked {
+            let entries = self.bulk_list_matches.clone();
+            self.start_download(entries);
+        }
+        if delete_clicked {
+            let entries = self.bulk_list_matches.clone();
+            let allow_move_aside = self.bulk_delete_move_aside_agreed;
+            self.start_bulk_delete(entries, allow_move_aside);
         }
     }
 }
@@ -2233,7 +2292,7 @@ impl eframe::App for GDriveCopierApp {
 // Thành phần giao diện dùng chung
 // ---------------------------------------------------------------------------
 
-/// Màu nhấn cho nút chính ("Tải xuống").
+/// Màu nhấn cho nút chính ("Tải đã chọn").
 const ACCENT: Color32 = Color32::from_rgb(45, 108, 223);
 
 /// Chiều cao 1 dòng trong bảng file — CỐ ĐỊNH để `ScrollArea::show_rows` chỉ
