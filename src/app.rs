@@ -1552,7 +1552,7 @@ impl GDriveCopierApp {
     }
 
     /// Thông báo trạng thái (thành công/lỗi) đặt ngay phía trên danh sách
-    /// để không bị đẩy ra khỏi tầm nhìn, có nút ✕ để đóng.
+    /// để không bị đẩy ra khỏi tầm nhìn, có nút ✖ để đóng.
     fn draw_notice(&mut self, ui: &mut egui::Ui) {
         let Some((msg, is_error)) = self.status_message.clone() else {
             return;
@@ -1562,7 +1562,7 @@ impl GDriveCopierApp {
         banner_frame(color).show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                if ui.small_button("✕").on_hover_text("Đóng").clicked() {
+                if ui.small_button("✖").on_hover_text("Đóng").clicked() {
                     dismiss = true;
                 }
                 ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
@@ -1809,6 +1809,18 @@ impl GDriveCopierApp {
             } else {
                 self.selected.clear();
             }
+        }
+        if actions.invert_selection {
+            let mut inverted = HashSet::new();
+            for e in &self.current_entries {
+                if !self.selected.contains(&e.id) {
+                    inverted.insert(e.id.clone());
+                }
+            }
+            self.selected = inverted;
+            // Điểm neo (dùng cho shift-click) không còn ý nghĩa rõ ràng sau
+            // khi đảo hàng loạt — để trống, lần tick tay tiếp theo sẽ tự đặt lại.
+            self.selection_anchor = None;
         }
         if let Some((index, shift_held, checked)) = actions.selection_change {
             let len = self.current_entries.len();
@@ -2236,7 +2248,7 @@ const ACCENT: Color32 = Color32::from_rgb(45, 108, 223);
 /// Chiều cao 1 dòng trong bảng file — CỐ ĐỊNH để `ScrollArea::show_rows` chỉ
 /// vẽ đúng các dòng đang nhìn thấy (thư mục vài nghìn file vẫn mượt).
 const ROW_H: f32 = 26.0;
-const COL_CHECK_W: f32 = 30.0;
+const COL_CHECK_W: f32 = 90.0;
 const COL_SIZE_W: f32 = 150.0;
 const COL_ACTIONS_W: f32 = 118.0;
 const COL_GAP: f32 = 8.0;
@@ -2341,6 +2353,7 @@ struct TableActions {
     rename_confirmed: Option<(String, String)>,
     rename_cancelled: bool,
     delete_clicked: Option<DriveEntry>,
+    invert_selection: bool,
 }
 
 /// Dữ liệu chỉ-đọc dùng chung cho mọi dòng của bảng.
@@ -2370,6 +2383,13 @@ fn draw_table_header(
             actions.toggle_select_all = Some(master && !partially_selected);
         }
         resp.on_hover_text("Chọn tất cả / bỏ chọn tất cả");
+        if ui
+            .small_button("Đảo")
+            .on_hover_text("Đảo ngược lựa chọn hiện tại: bỏ chọn mục đang chọn, chọn mục còn lại")
+            .clicked()
+        {
+            actions.invert_selection = true;
+        }
     });
     cell(ui, cols.name, Layout::left_to_right(Align::Center), |ui| {
         ui.label(RichText::new("Tên").weak().small());
@@ -2437,8 +2457,11 @@ fn draw_entry_row(
                 let enter = resp.lost_focus() && ui.input(|inp| inp.key_pressed(egui::Key::Enter));
                 let esc = (resp.has_focus() || resp.lost_focus())
                     && ui.input(|inp| inp.key_pressed(egui::Key::Escape));
-                let ok_clicked = ui.button("✓").clicked();
-                let cancel_clicked = ui.button("✕").clicked();
+                // '✓'/'✕' (U+2713/U+2715) không có glyph trong font nào app
+                // dùng nên hiện ra ô vuông lỗi — dùng '✔'/'✖' (đã dùng an
+                // toàn ở chỗ khác trong app) thay thế.
+                let ok_clicked = ui.button("✔").clicked();
+                let cancel_clicked = ui.button("✖").clicked();
                 if ok_clicked || enter {
                     confirm = Some(draft.clone());
                 }
@@ -2510,6 +2533,18 @@ fn draw_entry_row(
         if is_renaming_this {
             return;
         }
+        // Layout phải→trái nên thêm THEO THỨ TỰ NGƯỢC với thứ tự muốn hiển
+        // thị: thêm trước nằm bên PHẢI cùng. Muốn trái→phải là Đổi tên, Tải,
+        // Xóa thì phải thêm Xóa trước, rồi Tải, rồi Đổi tên sau cùng.
+        if env.logged_in {
+            if ui
+                .add(egui::Button::new("🗑").frame_when_inactive(false))
+                .on_hover_text("Chuyển vào Thùng rác")
+                .clicked()
+            {
+                actions.delete_clicked = Some(entry.clone());
+            }
+        }
         if ui
             .add_enabled(
                 env.can_download,
@@ -2521,15 +2556,12 @@ fn draw_entry_row(
             actions.download_single = Some(entry.clone());
         }
         if env.logged_in {
+            // '✎' (U+270E) không có glyph trong bất kỳ font nào app dùng
+            // (kể cả mặc định của egui) nên hiện ra thành ô vuông lỗi trên
+            // nhiều máy — dùng '✏' (U+270F, bút chì thường) thay thế, có
+            // sẵn trong font NotoEmoji đi kèm egui.
             if ui
-                .add(egui::Button::new("🗑").frame_when_inactive(false))
-                .on_hover_text("Chuyển vào Thùng rác")
-                .clicked()
-            {
-                actions.delete_clicked = Some(entry.clone());
-            }
-            if ui
-                .add(egui::Button::new("✎").frame_when_inactive(false))
+                .add(egui::Button::new("✏").frame_when_inactive(false))
                 .on_hover_text("Đổi tên")
                 .clicked()
             {
@@ -2581,8 +2613,19 @@ fn selection_summary(
 
 /// Tô màu dòng nhật ký theo ký hiệu đầu dòng (✔ xong, ✘ lỗi, ↻/↪ cảnh báo...).
 fn log_line_text(ui: &egui::Ui, line: &str) -> RichText {
-    let text = RichText::new(line).monospace().size(12.0);
-    match line.chars().next() {
+    let first = line.chars().next();
+    // '✘' (U+2718, dùng ở đầu các dòng log lỗi) không có glyph trong bất kỳ
+    // font nào app dùng nên hiện ra ô vuông lỗi trên nhiều máy — chỉ đổi
+    // sang '✖' (an toàn, đã dùng ở chỗ khác) LÚC HIỂN THỊ ở đây, không đụng
+    // tới nội dung log gốc.
+    let text = if first == Some('✘') {
+        RichText::new(line.replacen('✘', "✖", 1))
+    } else {
+        RichText::new(line.to_owned())
+    }
+    .monospace()
+    .size(12.0);
+    match first {
         Some('✔') => text.color(tone_color(ui, Tone::Ok)),
         Some('✘') => text.color(tone_color(ui, Tone::Error)),
         Some('↻') | Some('↪') => text.color(tone_color(ui, Tone::Warn)),
