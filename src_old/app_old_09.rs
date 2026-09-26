@@ -1942,6 +1942,11 @@ impl GDriveCopierApp {
             self.activity_tab = ActivityTab::Log;
         }
         ui.horizontal(|ui| {
+            ui.selectable_value(
+                &mut self.activity_tab,
+                ActivityTab::Log,
+                format!("Nhật ký ({})", self.log.len()),
+            );
             if import_available {
                 ui.selectable_value(
                     &mut self.activity_tab,
@@ -1949,11 +1954,6 @@ impl GDriveCopierApp {
                     "Nhập danh sách",
                 );
             }
-            ui.selectable_value(
-                &mut self.activity_tab,
-                ActivityTab::Log,
-                format!("Nhật ký ({})", self.log.len()),
-            );
         });
         ui.separator();
 
@@ -2100,8 +2100,11 @@ impl GDriveCopierApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.weak(
-                    "Dán danh sách tên (mỗi dòng 1 tên) hoặc kéo-thả file .txt, rồi bấm Nhập để \
-                     tick chọn các file khớp tên ở bảng bên trái.",
+                    "Dán danh sách tên (mỗi tên 1 dòng, hoặc cách nhau bằng dấu phẩy/chấm \
+                     phẩy/khoảng trắng), hoặc kéo-thả 1 file .txt vào cửa sổ, rồi bấm Nhập để \
+                     tự động tick chọn đúng các file đó trong danh sách bên trái. Tên phải khớp \
+                     CHÍNH XÁC tên đang hiển thị trong thư mục đang xem. Sau khi tick xong, dùng \
+                     nút \"Tải xuống\" hoặc \"Xóa\" ở khung bên trái như bình thường.",
                 );
                 ui.add_space(4.0);
                 // Giới hạn chiều cao hiển thị — không bọc thì egui tự giãn
