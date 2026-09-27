@@ -232,7 +232,7 @@ impl GDriveCopierApp {
             bulk_list_matches: Vec::new(),
             bulk_list_unmatched: Vec::new(),
             bulk_delete_move_aside_agreed: true,
-            activity_tab: ActivityTab::ImportList,
+            activity_tab: ActivityTab::Log,
             rename_focus: false,
             runtime,
             event_tx,
@@ -1950,16 +1950,21 @@ impl GDriveCopierApp {
         self.draw_job_card(ui);
         ui.add_space(4.0);
 
-        // Luôn hiện CẢ HAI tab (không ẩn/hiện qua lại) để bố cục ổn định,
-        // không bị nhảy khi mở/đóng thư mục — tab "Nhập danh sách" tự khóa
-        // (mờ) phần khung nhập bên trong khi chưa có thư mục nào để khớp
-        // tên, xem `draw_import_list_tab`, thay vì ẩn hẳn cả tab.
+        // Chỉ cần đã mở 1 thư mục để có mục mà khớp tên — bản thân việc
+        // NHẬP (khớp tên rồi tick chọn) không cần đăng nhập; đăng nhập chỉ
+        // cần khi người dùng bấm nút "Xóa" ở khung trái cho các mục đã tick.
+        let import_available = !self.current_entries.is_empty();
+        if !import_available && self.activity_tab == ActivityTab::ImportList {
+            self.activity_tab = ActivityTab::Log;
+        }
         ui.horizontal(|ui| {
-            ui.selectable_value(
-                &mut self.activity_tab,
-                ActivityTab::ImportList,
-                "Nhập danh sách",
-            );
+            if import_available {
+                ui.selectable_value(
+                    &mut self.activity_tab,
+                    ActivityTab::ImportList,
+                    "Nhập danh sách",
+                );
+            }
             ui.selectable_value(
                 &mut self.activity_tab,
                 ActivityTab::Log,
@@ -2104,10 +2109,6 @@ impl GDriveCopierApp {
     /// giống nhau ở 2 nơi.
     fn draw_import_list_tab(&mut self, ui: &mut egui::Ui) {
         let busy = self.is_busy();
-        // Chưa mở thư mục nào thì chưa có gì để khớp tên — thay vì ẨN cả
-        // tab (gây nhảy bố cục khi mở/đóng thư mục), chỉ LÀM MỜ khung nhập
-        // bên dưới; mở thư mục xong tự bật lại, không cần thao tác gì thêm.
-        let has_folder = !self.current_entries.is_empty();
         let mut import_clicked = false;
 
         egui::ScrollArea::vertical()
@@ -2118,38 +2119,28 @@ impl GDriveCopierApp {
                     "Dán danh sách tên (mỗi dòng 1 tên) hoặc kéo-thả file .txt, rồi bấm Nhập để \
                      chọn các file khớp tên ở bảng bên trái.",
                 );
-                if !has_folder {
-                    ui.add_space(4.0);
-                    ui.colored_label(
-                        tone_color(ui, Tone::Warn),
-                        "Mở một thư mục Drive trước đã, rồi mới khớp tên được.",
-                    );
-                }
                 ui.add_space(4.0);
                 // Giới hạn chiều cao hiển thị — không bọc thì egui tự giãn
                 // ô nhập cao theo đúng số dòng nội dung, dán danh sách vài
                 // trăm dòng sẽ chiếm hết khung, khó theo dõi các phần bên
                 // dưới. Nội dung dài hơn khung vẫn cuộn được bình thường,
                 // không mất chữ.
-                ui.add_enabled_ui(has_folder, |ui| {
-                    egui::ScrollArea::vertical()
-                        .id_salt("bulk_list_input_scroll")
-                        .max_height(150.0)
-                        .show(ui, |ui| {
-                            ui.add(
-                                egui::TextEdit::multiline(&mut self.bulk_list_input)
-                                    .desired_rows(5)
-                                    .desired_width(f32::INFINITY)
-                                    .hint_text("vidu_1.mp4, vidu_2.jpg\nvidu_3.mp4; vidu_4.png\n..."),
-                            );
-                        });
-                });
+                egui::ScrollArea::vertical()
+                    .id_salt("bulk_list_input_scroll")
+                    .max_height(150.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.bulk_list_input)
+                                .desired_rows(5)
+                                .desired_width(f32::INFINITY)
+                                .hint_text("vidu_1.mp4, vidu_2.jpg\nvidu_3.mp4; vidu_4.png\n..."),
+                        );
+                    });
                 ui.add_space(4.0);
-                let mut import_resp = ui.add_enabled(has_folder && !busy, egui::Button::new("Nhập"));
-                if !has_folder {
-                    import_resp = import_resp.on_hover_text("Mở một thư mục Drive trước đã");
-                }
-                if import_resp.clicked() {
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Nhập"))
+                    .clicked()
+                {
                     import_clicked = true;
                 }
 
