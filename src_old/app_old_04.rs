@@ -1875,95 +1875,71 @@ impl GDriveCopierApp {
     // ------------------------------------------------------------------
 
     fn draw_bottom_bar(&mut self, ui: &mut egui::Ui) {
-        // Cụm "Tiến độ" (xem `draw_job_card`) đặt CỐ ĐỊNH ở rìa phải cùng
-        // của thanh này, ngang hàng với "Lưu vào.../Nếu trùng tên" — chiều
-        // rộng cố định (đủ chỗ cho thanh tiến độ + số liệu khi có tác vụ
-        // đang chạy), chiều cao tự co giãn theo nội dung (thấp khi rảnh,
-        // cao hơn khi đang tải) nhờ truyền `desired_size.y = 0.0` cho
-        // `allocate_ui_with_layout` — theo đúng cơ chế của hàm đó, kích
-        // thước cấp phát cuối cùng lấy theo nội dung THẬT SỰ dùng, 0.0 chỉ
-        // là gợi ý khởi điểm. Phần bên trái chiếm hết chỗ rộng còn lại.
-        const PROGRESS_W: f32 = 280.0;
-        ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
-            let left_w =
-                (ui.available_width() - PROGRESS_W - ui.spacing().item_spacing.x).max(160.0);
-            let mut pick = false;
-            let mut open_folder = false;
-            ui.allocate_ui_with_layout(vec2(left_w, 0.0), Layout::top_down(Align::Min), |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Lưu vào:");
-                    let full = self
-                        .destination
-                        .as_ref()
-                        .map(|p| p.display().to_string());
-                    let shown = full.clone().unwrap_or_else(|| "(chưa chọn)".to_string());
-                    let path_w = (ui.available_width() * 0.5).clamp(180.0, 480.0);
-                    ui.allocate_ui_with_layout(
-                        vec2(path_w, 24.0),
-                        Layout::left_to_right(Align::Center),
-                        |ui| {
-                            let resp = ui.add(
-                                egui::Label::new(RichText::new(shown).monospace())
-                                    .truncate()
-                                    .show_tooltip_when_elided(false),
-                            );
-                            if let Some(full) = &full {
-                                resp.on_hover_text(full.as_str());
-                            }
-                        },
-                    );
-                    if ui.button("Chọn thư mục...").clicked() {
-                        pick = true;
-                    }
-                    if self.destination.is_some()
-                        && ui
-                            .button("Mở")
-                            .on_hover_text("Mở thư mục này trong trình quản lý file")
-                            .clicked()
-                    {
-                        open_folder = true;
-                    }
-
-                    ui.separator();
-
-                    ui.label("Nếu trùng tên:");
-                    // Dùng biến cục bộ cho ComboBox, không đụng `self` bên
-                    // trong closure lồng của `show_ui` — chỉ ghi lại vào
-                    // self SAU KHI combo box đã đóng, để chắc chắn không
-                    // vướng borrow-checker.
-                    let mut new_policy = self.config.conflict_policy;
-                    egui::ComboBox::from_id_salt("conflict_policy_combo")
-                        .selected_text(new_policy.label())
-                        .show_ui(ui, |ui| {
-                            for policy in [
-                                ConflictPolicy::Skip,
-                                ConflictPolicy::Overwrite,
-                                ConflictPolicy::Rename,
-                            ] {
-                                ui.selectable_value(&mut new_policy, policy, policy.label());
-                            }
-                        });
-                    if new_policy != self.config.conflict_policy {
-                        self.config.conflict_policy = new_policy;
-                        let _ = self.config.save();
-                    }
-                });
-            });
-            if pick {
-                self.start_pick_folder();
-            }
-            if open_folder {
-                self.open_destination();
-            }
-
+        let mut pick = false;
+        let mut open_folder = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Lưu vào:");
+            let full = self
+                .destination
+                .as_ref()
+                .map(|p| p.display().to_string());
+            let shown = full.clone().unwrap_or_else(|| "(chưa chọn)".to_string());
+            let path_w = (ui.available_width() * 0.5).clamp(180.0, 480.0);
             ui.allocate_ui_with_layout(
-                vec2(PROGRESS_W, 0.0),
-                Layout::top_down(Align::Min),
+                vec2(path_w, 24.0),
+                Layout::left_to_right(Align::Center),
                 |ui| {
-                    self.draw_job_card(ui);
+                    let resp = ui.add(
+                        egui::Label::new(RichText::new(shown).monospace())
+                            .truncate()
+                            .show_tooltip_when_elided(false),
+                    );
+                    if let Some(full) = &full {
+                        resp.on_hover_text(full.as_str());
+                    }
                 },
             );
+            if ui.button("Chọn thư mục...").clicked() {
+                pick = true;
+            }
+            if self.destination.is_some()
+                && ui
+                    .button("Mở")
+                    .on_hover_text("Mở thư mục này trong trình quản lý file")
+                    .clicked()
+            {
+                open_folder = true;
+            }
+
+            ui.separator();
+
+            ui.label("Nếu trùng tên:");
+            // Dùng biến cục bộ cho ComboBox, không đụng `self` bên trong
+            // closure lồng của `show_ui` — chỉ ghi lại vào self SAU KHI
+            // combo box đã đóng, để chắc chắn không vướng borrow-checker.
+            let mut new_policy = self.config.conflict_policy;
+            egui::ComboBox::from_id_salt("conflict_policy_combo")
+                .selected_text(new_policy.label())
+                .show_ui(ui, |ui| {
+                    for policy in [
+                        ConflictPolicy::Skip,
+                        ConflictPolicy::Overwrite,
+                        ConflictPolicy::Rename,
+                    ] {
+                        ui.selectable_value(&mut new_policy, policy, policy.label());
+                    }
+                });
+            if new_policy != self.config.conflict_policy {
+                self.config.conflict_policy = new_policy;
+                let _ = self.config.save();
+            }
         });
+        if pick {
+            self.start_pick_folder();
+        }
+        if open_folder {
+            self.open_destination();
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1971,9 +1947,9 @@ impl GDriveCopierApp {
     // ------------------------------------------------------------------
 
     fn draw_activity_panel(&mut self, ui: &mut egui::Ui) {
-        // Cụm "Tiến độ" đã chuyển xuống thanh dưới cùng (xem
-        // `draw_bottom_bar`) để 2 tab dưới đây luôn ở vị trí cao nhất, cố
-        // định của khung bên phải.
+        self.draw_job_card(ui);
+        ui.add_space(4.0);
+
         // Luôn hiện CẢ HAI tab (không ẩn/hiện qua lại) để bố cục ổn định,
         // không bị nhảy khi mở/đóng thư mục — tab "Nhập danh sách" tự khóa
         // (mờ) phần khung nhập bên trong khi chưa có thư mục nào để khớp
@@ -1998,9 +1974,8 @@ impl GDriveCopierApp {
         }
     }
 
-    /// Tiến độ của tác vụ đang chạy — đặt ở rìa phải thanh dưới cùng, xem
-    /// `draw_bottom_bar`, nên luôn thấy được, không bị đẩy đi mất dù đang
-    /// duyệt/chọn ở vùng giữa hay đổi tab bên phải.
+    /// Tiến độ của tác vụ đang chạy (luôn ở đầu khung bên phải, không bị
+    /// đẩy đi mất dù đang duyệt/chọn ở vùng giữa).
     fn draw_job_card(&mut self, ui: &mut egui::Ui) {
         ui.strong("Tiến độ");
         let mut cancel = false;
@@ -2143,6 +2118,13 @@ impl GDriveCopierApp {
                     "Dán danh sách tên (mỗi dòng 1 tên) hoặc kéo-thả file .txt, rồi bấm Nhập để \
                      chọn các file khớp tên ở bảng bên trái.",
                 );
+                if !has_folder {
+                    ui.add_space(4.0);
+                    ui.colored_label(
+                        tone_color(ui, Tone::Warn),
+                        "Mở một thư mục Drive trước đã, rồi mới khớp tên được.",
+                    );
+                }
                 ui.add_space(4.0);
                 // Giới hạn chiều cao hiển thị — không bọc thì egui tự giãn
                 // ô nhập cao theo đúng số dòng nội dung, dán danh sách vài
@@ -2169,17 +2151,6 @@ impl GDriveCopierApp {
                 }
                 if import_resp.clicked() {
                     import_clicked = true;
-                }
-                // Đặt dòng nhắc này SAU khung nhập + nút Nhập (không phải
-                // trước) — để khung nhập và nút luôn đứng CỐ ĐỊNH 1 chỗ,
-                // không bị đẩy lên/xuống mỗi khi dòng nhắc này ẩn/hiện theo
-                // việc mở/đóng thư mục.
-                if !has_folder {
-                    ui.add_space(4.0);
-                    ui.colored_label(
-                        tone_color(ui, Tone::Warn),
-                        "Mở một thư mục Drive trước đã, rồi mới khớp tên được.",
-                    );
                 }
 
                 // Chỉ còn hiện DANH SÁCH KHÔNG KHỚP ở đây — mục khớp thì đã
