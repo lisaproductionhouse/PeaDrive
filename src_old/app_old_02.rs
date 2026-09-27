@@ -14,7 +14,7 @@
 //! │ 120 mục · đã chọn 3          [🗑 Xóa][⬇ Tải xuống]│ 1.2/4.5 GB ...   │
 //! │ ☐ Tên                 Dung lượng            │ [Nhật ký|Nhập ds]│
 //! │ ☐ 📁 Thư mục A        xem dung lượng   Tải  │  ✔ a.jpg         │
-//! │ ☑ 🎬 clip.mp4         1.2 GB      ✏ Tải 🗑  │  ✖ b.mp4: lỗi    │
+//! │ ☑ 🎬 clip.mp4         1.2 GB      Tải ✎ 🗑  │  ✘ b.mp4: lỗi    │
 //! ├─────────────────────────────────────────────┴──────────────────┤
 //! │ Lưu vào: D:\Tai-ve [Chọn...] [Mở]    Nếu trùng tên: [Bỏ qua ▾] │ thanh dưới
 //! └────────────────────────────────────────────────────────────────┘
@@ -1821,10 +1821,6 @@ impl GDriveCopierApp {
             // Điểm neo (dùng cho shift-click) không còn ý nghĩa rõ ràng sau
             // khi đảo hàng loạt — để trống, lần tick tay tiếp theo sẽ tự đặt lại.
             self.selection_anchor = None;
-            // Đếm lại SAU KHI đã đảo (self.selected lúc này là danh sách
-            // mới) — nếu còn banner "Đã chọn..." cũ từ lần Nhập trước, số
-            // trong đó sẽ sai so với lựa chọn thật sự nếu không ghi đè lại.
-            self.set_status(format!("Đã chọn {} mục", self.selected.len()), false);
         }
         if let Some((index, shift_held, checked)) = actions.selection_change {
             let len = self.current_entries.len();
@@ -2117,7 +2113,7 @@ impl GDriveCopierApp {
             .show(ui, |ui| {
                 ui.weak(
                     "Dán danh sách tên (mỗi dòng 1 tên) hoặc kéo-thả file .txt, rồi bấm Nhập để \
-                     chọn các file khớp tên ở bảng bên trái.",
+                     tick chọn các file khớp tên ở bảng bên trái.",
                 );
                 ui.add_space(4.0);
                 // Giới hạn chiều cao hiển thị — không bọc thì egui tự giãn
@@ -2178,7 +2174,7 @@ impl GDriveCopierApp {
                 for e in &self.bulk_list_matches {
                     self.selected.insert(e.id.clone());
                 }
-                let mut msg = format!("Đã chọn {} mục", self.bulk_list_matches.len());
+                let mut msg = format!("Đã tick chọn {} mục", self.bulk_list_matches.len());
                 if !self.bulk_list_unmatched.is_empty() {
                     msg.push_str(&format!(
                         " · {} tên không khớp mục nào",

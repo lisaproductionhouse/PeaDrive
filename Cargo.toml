@@ -1,5 +1,5 @@
 [package]
-name = "PeaDrive"
+name = "peaDrive"
 version = "0.1.0"
 edition = "2021"
 description = "Sao chép trực tiếp file/thư mục từ một thư mục Google Drive công khai ra ổ đĩa (API key, không cần đăng nhập); tùy chọn đăng nhập Google (OAuth) để đổi tên/xóa file trên thư mục đã chia sẻ quyền chỉnh sửa."

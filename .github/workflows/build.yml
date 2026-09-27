@@ -28,4 +28,4 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: PeaDrive-Windows
-        path: target/release/PeaDrive.exe
+        path: target/release/peaDrive.exe
