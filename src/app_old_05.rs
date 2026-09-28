@@ -1883,7 +1883,7 @@ impl GDriveCopierApp {
         // `allocate_ui_with_layout` — theo đúng cơ chế của hàm đó, kích
         // thước cấp phát cuối cùng lấy theo nội dung THẬT SỰ dùng, 0.0 chỉ
         // là gợi ý khởi điểm. Phần bên trái chiếm hết chỗ rộng còn lại.
-        const PROGRESS_W: f32 = 340.0;
+        const PROGRESS_W: f32 = 280.0;
         ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
             let left_w =
                 (ui.available_width() - PROGRESS_W - ui.spacing().item_spacing.x).max(160.0);
@@ -2002,30 +2002,20 @@ impl GDriveCopierApp {
     /// `draw_bottom_bar`, nên luôn thấy được, không bị đẩy đi mất dù đang
     /// duyệt/chọn ở vùng giữa hay đổi tab bên phải.
     fn draw_job_card(&mut self, ui: &mut egui::Ui) {
-        // "Tiến độ:" luôn ghép CHUNG 1 hàng ngang với chỉ báo trạng thái đi
-        // kèm (spinner+chữ, hoặc thanh tiến độ) thay vì để riêng 1 dòng rồi
-        // mới tới chỉ báo — tránh rớt xuống thành 2 dòng vừa vô lý vừa tốn
-        // chiều cao của thanh dưới cùng. Các phần PHỤ (bảng số liệu, tên
-        // file đang tải, nút Hủy) vẫn nằm ở các dòng tiếp theo như cũ vì tự
-        // nó đã nhiều dòng, không cách nào gộp chung 1 hàng được.
+        ui.strong("Tiến độ");
         let mut cancel = false;
         match &self.job {
             JobState::Idle => {
-                ui.horizontal(|ui| {
-                    ui.strong("Tiến độ:");
-                    ui.weak("Chưa có tác vụ nào đang chạy.");
-                });
+                ui.weak("Chưa có tác vụ nào đang chạy.");
             }
             JobState::Loading => {
                 ui.horizontal(|ui| {
-                    ui.strong("Tiến độ:");
                     ui.spinner();
                     ui.label("Đang tải danh sách...");
                 });
             }
             JobState::Scanning { found } => {
                 ui.horizontal_wrapped(|ui| {
-                    ui.strong("Tiến độ:");
                     ui.spinner();
                     ui.label(format!("Đang quét thư mục... đã tìm thấy {found} file"));
                 });
@@ -2047,14 +2037,11 @@ impl GDriveCopierApp {
                 } else {
                     0.0
                 };
-                ui.horizontal(|ui| {
-                    ui.strong("Tiến độ:");
-                    ui.add(
-                        egui::ProgressBar::new(frac)
-                            .text(format!("{done_files}/{total_files} file"))
-                            .desired_height(20.0),
-                    );
-                });
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .text(format!("{done_files}/{total_files} file"))
+                        .desired_height(20.0),
+                );
                 egui::Grid::new("job_stats")
                     .num_columns(2)
                     .spacing([12.0, 3.0])
@@ -2093,14 +2080,11 @@ impl GDriveCopierApp {
                 } else {
                     0.0
                 };
-                ui.horizontal(|ui| {
-                    ui.strong("Tiến độ:");
-                    ui.add(
-                        egui::ProgressBar::new(frac)
-                            .text(format!("Đang chuyển vào Thùng rác: {done}/{total}"))
-                            .desired_height(20.0),
-                    );
-                });
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .text(format!("Đang chuyển vào Thùng rác: {done}/{total}"))
+                        .desired_height(20.0),
+                );
             }
         }
         if cancel {
