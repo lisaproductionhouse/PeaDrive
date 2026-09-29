@@ -1486,33 +1486,18 @@ impl GDriveCopierApp {
     // ------------------------------------------------------------------
 
     fn draw_browser(&mut self, ui: &mut egui::Ui) {
-        // Ghim đường dẫn ở TRÊN CÙNG và hàng thông báo+nút hành động ở SÁT
-        // TRÊN thanh dưới cùng bằng 2 Panel lồng — phần còn lại (giữa) mới
-        // là chỗ của xác nhận xóa/bảng file, xem `draw_action_row`.
-        // `.show_separator_line(false)` vì đây vốn không phải ranh giới
-        // điều hướng riêng, chỉ là 1 hàng trong cùng khu vực nội dung.
-        egui::Panel::top("browser_path_bar")
-            .show_separator_line(false)
-            .show(ui, |ui| {
-                self.draw_path_bar(ui);
-            });
-        egui::Panel::bottom("browser_action_row")
-            .show_separator_line(false)
-            .show(ui, |ui| {
-                self.draw_action_row(ui);
-            });
+        self.draw_path_bar(ui);
+        self.draw_notice(ui);
         self.draw_delete_confirm(ui);
         if self.current_entries.is_empty() {
             self.draw_empty_state(ui);
             return;
         }
+        self.draw_list_toolbar(ui);
         self.draw_file_table(ui);
     }
 
-    /// ⬆ lên thư mục cha, ⟳ tải lại, breadcrumb (bấm vào để quay lại, tự
-    /// xuống dòng nếu quá dài) bên trái — số lượng mục ghim cố định ở góc
-    /// phải cùng hàng này (nút Tải xuống/Xóa cho phần đã chọn nằm ở hàng
-    /// riêng sát trên thanh dưới cùng, xem `draw_action_row`).
+    /// ⬆ lên thư mục cha, ⟳ tải lại, rồi breadcrumb (bấm vào để quay lại).
     fn draw_path_bar(&mut self, ui: &mut egui::Ui) {
         let busy = self.is_busy();
         let can_up = !busy && self.breadcrumbs.len() >= 2;
@@ -1521,48 +1506,41 @@ impl GDriveCopierApp {
         let mut go_to: Option<usize> = None;
         let mut go_up = false;
         let mut reload = false;
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if !self.breadcrumbs.is_empty() {
-                ui.weak(format!("{} mục", self.current_entries.len()));
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(can_up, egui::Button::new("⬆"))
+                .on_hover_text("Lên thư mục cha")
+                .clicked()
+            {
+                go_up = true;
             }
-            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .add_enabled(can_up, egui::Button::new("⬆"))
-                        .on_hover_text("Lên thư mục cha")
-                        .clicked()
-                    {
-                        go_up = true;
-                    }
-                    if ui
-                        .add_enabled(can_reload, egui::Button::new("⟳"))
-                        .on_hover_text("Tải lại thư mục này")
-                        .clicked()
-                    {
-                        reload = true;
-                    }
-                    if self.breadcrumbs.is_empty() {
-                        ui.weak("Chưa mở thư mục nào");
-                    }
-                    let last_idx = self.breadcrumbs.len().saturating_sub(1);
-                    for (i, (_, name)) in self.breadcrumbs.iter().enumerate() {
-                        if i > 0 {
-                            ui.weak("›");
-                        }
-                        if i == last_idx {
-                            ui.strong(name);
-                        } else if ui
-                            .add_enabled(!busy, egui::Link::new(name.as_str()))
-                            .clicked()
-                        {
-                            go_to = Some(i);
-                        }
-                    }
-                    if loading {
-                        ui.spinner();
-                    }
-                });
-            });
+            if ui
+                .add_enabled(can_reload, egui::Button::new("⟳"))
+                .on_hover_text("Tải lại thư mục này")
+                .clicked()
+            {
+                reload = true;
+            }
+            if self.breadcrumbs.is_empty() {
+                ui.weak("Chưa mở thư mục nào");
+            }
+            let last_idx = self.breadcrumbs.len().saturating_sub(1);
+            for (i, (_, name)) in self.breadcrumbs.iter().enumerate() {
+                if i > 0 {
+                    ui.weak("›");
+                }
+                if i == last_idx {
+                    ui.strong(name);
+                } else if ui
+                    .add_enabled(!busy, egui::Link::new(name.as_str()))
+                    .clicked()
+                {
+                    go_to = Some(i);
+                }
+            }
+            if loading {
+                ui.spinner();
+            }
         });
         if go_up {
             self.go_up();
@@ -1685,23 +1663,19 @@ impl GDriveCopierApp {
     /// Dòng công cụ phía trên bảng: số mục + tóm tắt phần đã chọn (trái),
     /// nút Tải xuống / Xóa cho phần đã chọn (phải) — chọn tất cả đã có ô
     /// tick ở đầu bảng (`draw_table_header`) nên không cần thêm nút riêng.
-    /// Hàng gộp thông báo trạng thái (chiếm hết chỗ rộng bên trái) + 2 nút
-    /// Tải xuống/Xóa cho các mục đã chọn (ghim bên phải), đặt sát trên
-    /// thanh Bottom Bar — xem `draw_browser`. Số lượng/dung lượng đã chọn
-    /// giờ chỉ còn trong ngoặc trên nhãn nút + tooltip, không chiếm thêm 1
-    /// dòng riêng như trước (dòng đếm tổng số mục đã chuyển lên
-    /// `draw_path_bar`).
-    fn draw_action_row(&mut self, ui: &mut egui::Ui) {
+    fn draw_list_toolbar(&mut self, ui: &mut egui::Ui) {
         let busy = self.is_busy();
         let logged_in = self.is_logged_in();
-        let has_entries = !self.current_entries.is_empty();
+        let n = self.current_entries.len();
         let (sel_count, sel_bytes, sel_unknown) =
             selection_summary(&self.current_entries, &self.selected, &self.folder_sizes);
         let mut download_selected = false;
         let mut delete_selected = false;
 
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if has_entries {
+        ui.allocate_ui_with_layout(
+            vec2(ui.available_width(), 30.0),
+            Layout::right_to_left(Align::Center),
+            |ui| {
                 let delete_resp = ui.add_enabled(
                     !busy && sel_count > 0 && logged_in,
                     egui::Button::new("🗑 Xóa"),
@@ -1715,36 +1689,33 @@ impl GDriveCopierApp {
                     delete_selected = true;
                 }
 
-                let download_label = if sel_count > 0 {
-                    format!("⬇ Tải xuống ({sel_count})")
-                } else {
-                    "⬇ Tải xuống".to_string()
-                };
-                let primary = egui::Button::new(RichText::new(download_label).color(Color32::WHITE))
-                    .fill(ACCENT);
-                let download_resp = ui.add_enabled(!busy && sel_count > 0, primary);
-                let download_resp = if sel_count > 0 {
-                    let mut tip =
-                        format!("Tải {sel_count} mục đã chọn (~{})", format_bytes(sel_bytes));
-                    if sel_unknown > 0 {
-                        tip.push_str(&format!(
-                            " · +{sel_unknown} thư mục chưa rõ dung lượng"
-                        ));
-                    }
-                    download_resp.on_hover_text(tip)
-                } else {
-                    download_resp
-                };
-                if download_resp.clicked() {
+                let primary =
+                    egui::Button::new(RichText::new("⬇ Tải xuống").color(Color32::WHITE))
+                        .fill(ACCENT);
+                if ui
+                    .add_enabled(!busy && sel_count > 0, primary)
+                    .clicked()
+                {
                     download_selected = true;
                 }
-            }
 
-            // Thông báo trạng thái chiếm hết phần rộng còn lại bên trái.
-            ui.with_layout(Layout::left_to_right(Align::Min), |ui| {
-                self.draw_notice(ui);
-            });
-        });
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    let mut text = format!("{n} mục");
+                    if sel_count > 0 {
+                        text.push_str(&format!(
+                            " · đã chọn {sel_count} (~{})",
+                            format_bytes(sel_bytes)
+                        ));
+                        if sel_unknown > 0 {
+                            text.push_str(&format!(
+                                " · +{sel_unknown} thư mục chưa rõ dung lượng"
+                            ));
+                        }
+                    }
+                    ui.add(egui::Label::new(text).truncate());
+                });
+            },
+        );
 
         if download_selected {
             let sel: Vec<DriveEntry> = self
@@ -2168,7 +2139,7 @@ impl GDriveCopierApp {
     /// Ô nhập danh sách tên: khớp với thư mục đang xem rồi TỰ ĐỘNG TICK CHỌN
     /// đúng các mục đó ngay trên bảng file ở khung trái — không tự tải/xóa
     /// gì ở đây cả, người dùng dùng lại 2 nút "Tải xuống" / "Xóa" đã có sẵn
-    /// trên khung trái (trong `draw_action_row`) cho các mục vừa tick,
+    /// trên khung trái (trong `draw_list_toolbar`) cho các mục vừa tick,
     /// giống hệt như khi tick tay từng dòng. Nhờ vậy chỉ có DUY NHẤT một
     /// luồng thực thi tải/xóa trong toàn bộ app, đỡ phải giữ 2 bản logic
     /// giống nhau ở 2 nơi.
